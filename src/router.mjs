@@ -14,6 +14,8 @@
 import http from 'node:http';
 import https from 'node:https';
 
+import { createOpenAIAdapter } from './adapters/openai.mjs';
+import { createAdapterRegistry, UnsupportedAdapterError } from './adapters/registry.mjs';
 import { isByokModelId } from './catalog.mjs';
 
 const MAX_MODELS_BYTES = 8 * 1024 * 1024;
@@ -25,6 +27,9 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 // A provider that accepts the connection and then goes silent would otherwise hang
 // the turn indefinitely. Generous, because reasoning models legitimately take minutes.
 const PROVIDER_IDLE_TIMEOUT_MS = Number(process.env.COPILOT_BYOK_PROVIDER_TIMEOUT_MS) || 600_000;
+const adapters = createAdapterRegistry([
+  createOpenAIAdapter({ providerIdleTimeoutMs: PROVIDER_IDLE_TIMEOUT_MS }),
+]);
 
 /**
  * @param {object}   options
@@ -64,7 +69,17 @@ async function handle({ req, res, body, catalog, upstream, onEvent }) {
           error: { message: `Unknown BYOK model: ${parsed.model}. Restart copilot-byok to rebuild the catalog.` },
         });
       }
-      return forwardToProvider({ req, res, payload: parsed, route, onEvent });
+      let adapter;
+      try {
+        adapter = adapters.resolve(route.adapterKind);
+      } catch (error) {
+        if (!(error instanceof UnsupportedAdapterError)) throw error;
+        onEvent({ type: 'error', code: error.code, adapter: error.kind, message: error.message });
+        return respondJson(res, 422, {
+          error: { code: error.code, adapter: error.kind, message: error.message },
+        });
+      }
+      return adapter.forward({ req, res, payload: parsed, route, onEvent });
     }
   }
 
@@ -132,112 +147,6 @@ export function mergeModels(payload, entries) {
   }
 
   return { payload: JSON.stringify(json), injected };
-}
-
-// ------------------------------------------------------------ forward to a provider
-
-// Providers reject an unsupported level outright — GLM-5.2 answers 400 to
-// `xhigh` while accepting `max` — and there is no server-side fallback. The level
-// is stepped down until one is accepted, and the outcome is remembered so the
-// same round trip is not repeated for the rest of the session.
-const EFFORT_LADDER = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
-const rejectedEfforts = new Map();
-
-function nextEffortDown(effort) {
-  const index = EFFORT_LADDER.indexOf(effort);
-  return index === -1 || index === EFFORT_LADDER.length - 1 ? null : EFFORT_LADDER[index + 1];
-}
-
-function forwardToProvider({ req, res, payload, route, onEvent }) {
-  const { provider, model } = route;
-  const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`);
-  const client = target.protocol === 'https:' ? https : http;
-
-  const outbound = { ...payload, model: model.model };
-
-  // Copilot accepts a reasoning effort but never forwards it to a BYOK provider —
-  // requests sent with low and high are identical on the wire. Applying the
-  // configured level here is what makes the setting take effect at all.
-  const configured = model.reasoningEffort || provider.reasoningEffort;
-  if (configured && outbound.reasoning_effort === undefined) {
-    const rejected = rejectedEfforts.get(`${provider.id}:${model.model}`) || new Set();
-    let effort = configured;
-    while (effort && rejected.has(effort)) effort = nextEffortDown(effort);
-    if (effort) outbound.reasoning_effort = effort;
-  }
-  const body = Buffer.from(JSON.stringify(outbound), 'utf8');
-
-  const headers = {
-    accept: req.headers.accept || 'application/json',
-    // Custom gateway headers come first so the computed ones below always win:
-    // a stale content-length corrupts the request and a wrong host breaks TLS SNI.
-    ...(provider.headers || {}),
-    'content-type': 'application/json',
-    'content-length': String(body.byteLength),
-    host: target.host,
-  };
-  if (provider.apiKey) headers.authorization = `Bearer ${provider.apiKey}`;
-
-  onEvent({ type: 'route', provider: provider.id, model: model.model });
-
-  const providerReq = client.request(
-    {
-      hostname: target.hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      path: target.pathname,
-      method: 'POST',
-      headers,
-    },
-    (providerRes) => {
-      // A 400 caused by the effort is recoverable: drop a level and try again,
-      // before a single byte has reached the client.
-      if (providerRes.statusCode === 400 && outbound.reasoning_effort) {
-        const key = `${provider.id}:${model.model}`;
-        const rejected = rejectedEfforts.get(key) || new Set();
-        rejected.add(outbound.reasoning_effort);
-        rejectedEfforts.set(key, rejected);
-
-        const fallback = nextEffortDown(outbound.reasoning_effort);
-        onEvent({
-          type: 'notice',
-          provider: provider.id,
-          message: `${model.model} rejected reasoning effort "${outbound.reasoning_effort}"`
-            + (fallback ? `, retrying with "${fallback}"` : ', retrying without it'),
-        });
-
-        providerRes.resume(); // discard the error body
-        return forwardToProvider({ req, res, payload, route, onEvent });
-      }
-
-      res.writeHead(providerRes.statusCode, providerRes.headers);
-      providerRes.pipe(res); // SSE streaming passes through untouched
-      // pipe() does not end the destination when the source fails, and an
-      // IncomingMessage with no error listener swallows the error: without this
-      // a provider that dies mid-stream would leave the session waiting forever.
-      endOnBrokenSource(providerRes, res, (message) => {
-        onEvent({ type: 'error', provider: provider.id, message });
-      });
-    }
-  );
-
-  providerReq.setTimeout(PROVIDER_IDLE_TIMEOUT_MS, () => {
-    providerReq.destroy(new Error(`no data for ${Math.round(PROVIDER_IDLE_TIMEOUT_MS / 1000)}s`));
-  });
-
-  providerReq.on('error', (error) => {
-    onEvent({ type: 'error', provider: provider.id, message: error.message });
-    respondJson(res, 502, {
-      error: { message: `${provider.name} is unreachable: ${error.message}` },
-    });
-  });
-
-  // A cancelled generation must stop the provider request too: otherwise it keeps
-  // streaming, and paid providers keep billing, for an answer nobody will read.
-  res.on('close', () => {
-    if (!res.writableEnded) providerReq.destroy();
-  });
-
-  providerReq.end(body);
 }
 
 // ------------------------------------------------------------------ passthrough

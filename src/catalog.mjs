@@ -11,7 +11,7 @@ const DEFAULT_EFFORT_LEVELS = ['low', 'medium', 'high'];
 
 /**
  * @param {object[]} providers   Already-resolved providers (with apiKey where needed).
- * @returns {{entries: object[], routes: Map<string, {provider: object, model: object}>}}
+ * @returns {{entries: object[], routes: Map<string, {provider: object, model: object, adapterKind?: string}>}}
  */
 export function buildCatalog(providers, onEvent = () => {}) {
   const entries = [];
@@ -34,7 +34,7 @@ export function buildCatalog(providers, onEvent = () => {}) {
         continue;
       }
 
-      routes.set(id, { provider, model });
+      routes.set(id, { provider, model, adapterKind: model.adapterKind ?? provider.adapterKind });
       entries.push(buildEntry({ id, provider, model }));
     }
   }

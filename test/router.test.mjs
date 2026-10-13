@@ -79,6 +79,94 @@ test('a BYOK request reaches the provider with the real model name', async () =>
   }
 });
 
+test('the default OpenAI adapter preserves a tool stream request and response bytes', async () => {
+  const frames = [
+    'data: {"id":"chat-1","choices":[{"delta":{"content":"Checking "}}]}\n\n',
+    'data: {"id":"chat-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":"}}]}}]}\n\n',
+    'data: {"id":"chat-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"Berlin\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    'data: [DONE]\n\n',
+  ];
+  const expectedStream = frames.join('');
+  let received;
+  const provider = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received = { path: req.url, body: JSON.parse(body) };
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const frame of frames) res.write(frame);
+      res.end();
+    });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+
+  const catalog = buildCatalog([{
+    id: 'trace', name: 'Trace', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'trace-model' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+
+  const request = {
+    model: 'byok-trace-trace-model',
+    stream: true,
+    messages: [{ role: 'user', content: 'Weather?' }],
+    tools: [{ type: 'function', function: { name: 'weather', parameters: { type: 'object' } } }],
+  };
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request),
+    });
+    assert.equal(await response.text(), expectedStream);
+    assert.equal(received.path, '/v1/chat/completions');
+    assert.deepEqual(received.body, { ...request, model: 'trace-model' });
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('an unavailable explicit adapter fails before provider traffic', async () => {
+  let providerRequests = 0;
+  const provider = http.createServer((_req, res) => {
+    providerRequests += 1;
+    res.writeHead(500).end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'native', name: 'Native', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', adapterKind: 'anthropic', models: [{ model: 'native-model' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-native-native-model', messages: [] }),
+    });
+    assert.equal(response.status, 422);
+    assert.deepEqual(await response.json(), { error: {
+      code: 'unsupported_adapter',
+      adapter: 'anthropic',
+      message: 'Unsupported provider adapter "anthropic". Register it before routing requests.',
+    } });
+    assert.equal(providerRequests, 0);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('an unknown BYOK id fails clearly instead of reaching GitHub', async () => {
   const catalog = buildCatalog([]);
   const router = createRouter({
