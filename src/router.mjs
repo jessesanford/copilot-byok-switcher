@@ -27,7 +27,7 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 // A provider that accepts the connection and then goes silent would otherwise hang
 // the turn indefinitely. Generous, because reasoning models legitimately take minutes.
 const PROVIDER_IDLE_TIMEOUT_MS = Number(process.env.COPILOT_BYOK_PROVIDER_TIMEOUT_MS) || 600_000;
-const adapters = createAdapterRegistry([
+const defaultAdapters = createAdapterRegistry([
   createOpenAIAdapter({ providerIdleTimeoutMs: PROVIDER_IDLE_TIMEOUT_MS }),
 ]);
 
@@ -38,15 +38,16 @@ const adapters = createAdapterRegistry([
  *   session (for example through /byok) take effect without a restart.
  * @param {object}   options.upstream  Resolver from createUpstreamResolver().
  * @param {function} [options.onEvent] Diagnostic callback: ({type, ...}) => void
+ * @param {object} [options.adapters] Adapter registry with a resolve(kind) method.
  */
-export function createRouter({ catalog, upstream: resolver, onEvent = () => {} }) {
+export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, adapters = defaultAdapters }) {
   const readCatalog = typeof catalog === 'function' ? catalog : () => catalog;
 
   return http.createServer((req, res) => {
     collectBody(req)
       .then(async (body) => {
         const origin = await resolver.resolve(req.headers.authorization);
-        return handle({ req, res, body, catalog: await readCatalog(), upstream: new URL(origin), onEvent });
+        return handle({ req, res, body, catalog: await readCatalog(), upstream: new URL(origin), onEvent, adapters });
       })
       .catch((error) => {
         onEvent({ type: 'error', message: error.message });
@@ -55,7 +56,7 @@ export function createRouter({ catalog, upstream: resolver, onEvent = () => {} }
   });
 }
 
-async function handle({ req, res, body, catalog, upstream, onEvent }) {
+async function handle({ req, res, body, catalog, upstream, onEvent, adapters }) {
   if (req.method === 'GET' && isModelsPath(req.url)) {
     return injectModels({ req, res, body, catalog, upstream, onEvent });
   }

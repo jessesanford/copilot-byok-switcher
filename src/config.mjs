@@ -8,6 +8,7 @@ const PROVIDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const PROVIDER_TYPES = new Set(['openai', 'anthropic', 'azure']);
 const WIRE_APIS = new Set(['completions', 'responses']);
 const TRANSPORTS = new Set(['http', 'websockets']);
+const ADAPTER_KIND_PATTERN = /^[a-z][a-z0-9-]*$/;
 const MODELS_AUTH_MODES = new Set([true, false, 'none', 'bearer', 'x-api-key', 'api-key']);
 const SECRET_QUERY_NAME_PATTERN = /(^|[-_.])(api[-_.]?key|subscription[-_.]?key|auth(?:orization)?|bearer|credential|password|secret|signature|sig|token)([-_.]|$)/i;
 
@@ -94,6 +95,7 @@ function normalizeProvider(provider, env, index, secrets = {}) {
   const transport = provider.transport == null
     ? undefined
     : requiredString(provider.transport, `Provider ${name} transport must be a non-empty string`).toLowerCase();
+  const adapterKind = normalizeAdapterKind(provider.adapterKind, `Provider ${name}`);
   const azureApiVersion = provider.azureApiVersion == null
     ? undefined
     : requiredString(provider.azureApiVersion, `Provider ${name} azureApiVersion must be a non-empty string`);
@@ -126,6 +128,7 @@ function normalizeProvider(provider, env, index, secrets = {}) {
     ...(bearerTokenEnv ? { bearerTokenEnv } : {}),
     ...(wireApi ? { wireApi } : {}),
     ...(transport ? { transport } : {}),
+    ...(adapterKind ? { adapterKind } : {}),
     ...(azureApiVersion ? { azureApiVersion } : {}),
     ...(modelIncludePrefixes ? { modelIncludePrefixes } : {}),
     ...(modelExcludePrefixes ? { modelExcludePrefixes } : {}),
@@ -162,9 +165,19 @@ function normalizeModels(value, providerName) {
       }
     }
     if (entry.label != null) requiredString(entry.label, `${where} label must be a non-empty string`);
+    const adapterKind = normalizeAdapterKind(entry.adapterKind, where);
 
-    return { ...entry, model };
+    return { ...entry, model, ...(adapterKind ? { adapterKind } : {}) };
   });
+}
+
+function normalizeAdapterKind(value, where) {
+  if (value == null) return undefined;
+  const kind = requiredString(value, `${where} adapterKind must be a non-empty string`).toLowerCase();
+  if (!ADAPTER_KIND_PATTERN.test(kind)) {
+    throw new Error(`${where} adapterKind must be a lowercase identifier containing only letters, numbers, and hyphens`);
+  }
+  return kind;
 }
 
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);

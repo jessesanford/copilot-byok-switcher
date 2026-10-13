@@ -264,6 +264,7 @@ test('normalizes additive transport, Azure, auth, and model filter options', asy
       authRequired: false,
       modelsAuth: 'api-key',
       transport: 'websockets',
+      adapterKind: 'Gemini-Native',
       azureApiVersion: '2025-04-01-preview',
       modelIncludePrefixes: [' chat- '],
       modelExcludePrefixes: ['chat-legacy'],
@@ -274,6 +275,7 @@ test('normalizes additive transport, Azure, auth, and model filter options', asy
   assert.equal(provider.authRequired, false);
   assert.equal(provider.modelsAuth, 'api-key');
   assert.equal(provider.transport, 'websockets');
+  assert.equal(provider.adapterKind, 'gemini-native');
   assert.equal(provider.azureApiVersion, '2025-04-01-preview');
   assert.deepEqual(provider.modelIncludePrefixes, ['chat-']);
   assert.deepEqual(provider.modelExcludePrefixes, ['chat-legacy']);
@@ -296,6 +298,21 @@ test('rejects invalid additive provider option values', async () => {
   }));
 
   await assert.rejects(() => loadConfigFromPath(configPath, {}), /modelIncludePrefixes|transport|authRequired|modelsAuth/);
+});
+
+test('rejects invalid adapter kinds', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'copilot-byok-'));
+  const configPath = join(dir, 'providers.json');
+  await writeFile(configPath, JSON.stringify({
+    providers: [{
+      id: 'invalid-adapter',
+      name: 'Invalid Adapter',
+      baseUrl: 'https://api.example.com/v1',
+      adapterKind: 'openai/native',
+    }],
+  }));
+
+  await assert.rejects(() => loadConfigFromPath(configPath, {}), /adapterKind must be a lowercase identifier/);
 });
 
 test('rejects an OpenAI wire API override on Anthropic providers', async () => {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
 
+import { createAdapterRegistry } from '../src/adapters/registry.mjs';
 import { buildCatalog } from '../src/catalog.mjs';
 import { createRouter, mergeModels } from '../src/router.mjs';
 import { createUpstreamResolver } from '../src/upstream.mjs';
@@ -128,6 +129,38 @@ test('the default OpenAI adapter preserves a tool stream request and response by
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));
     await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('createRouter accepts an adapter registry extension', async () => {
+  let forwarded = false;
+  const catalog = buildCatalog([{
+    id: 'native', name: 'Native', baseUrl: 'https://provider.invalid/v1',
+    apiKey: 'k', adapterKind: 'native', models: [{ model: 'native-model' }],
+  }]);
+  const adapters = createAdapterRegistry([{
+    kind: 'native',
+    forward({ res }) {
+      forwarded = true;
+      res.writeHead(204).end();
+    },
+  }]);
+  const router = createRouter({
+    catalog, adapters,
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-native-native-model', messages: [] }),
+    });
+    assert.equal(response.status, 204);
+    assert.equal(forwarded, true);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
   }
 });
 
