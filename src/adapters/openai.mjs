@@ -18,6 +18,17 @@ export function createOpenAIAdapter({ providerIdleTimeoutMs }) {
   });
 }
 
+function applyAuthPolicy({ target, headers, apiKey, policy }) {
+  if (!apiKey || policy.type === 'none') return;
+  if (policy.type === 'bearer') {
+    headers.authorization = `Bearer ${apiKey}`;
+  } else if (policy.type === 'x-api-key') {
+    headers[policy.header || 'x-api-key'] = apiKey;
+  } else if (policy.type === 'api-key') {
+    target.searchParams.set(policy.query || 'key', apiKey);
+  }
+}
+
 function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutMs }) {
   const { provider, model } = route;
   const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`);
@@ -39,14 +50,14 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
     'content-length': String(body.byteLength),
     host: target.host,
   };
-  if (provider.apiKey) headers.authorization = ['Bearer', provider.apiKey].join(' ');
+  applyAuthPolicy({ target, headers, apiKey: provider.apiKey, policy: route.authPolicy });
 
   onEvent({ type: 'route', provider: provider.id, model: model.model, adapter: 'openai' });
 
   const providerReq = client.request({
     hostname: target.hostname,
     port: target.port || (target.protocol === 'https:' ? 443 : 80),
-    path: target.pathname,
+    path: `${target.pathname}${target.search}`,
     method: 'POST',
     headers,
   }, (providerRes) => {

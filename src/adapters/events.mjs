@@ -268,7 +268,12 @@ function normalizeMetadata(metadata) {
   for (const [namespace, value] of Object.entries(metadata)) {
     requireString(namespace, 'metadata namespace');
     requireObject(value, `metadata.${namespace}`);
-    normalized[namespace] = value;
+    Object.defineProperty(normalized, namespace, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   return normalized;
 }

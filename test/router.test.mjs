@@ -80,6 +80,44 @@ test('a BYOK request reaches the provider with the real model name', async () =>
   }
 });
 
+test('the OpenAI adapter applies each declared authentication policy', async () => {
+  const received = [];
+  const provider = http.createServer((req, res) => {
+    received.push({ path: req.url, headers: req.headers });
+    req.resume();
+    res.writeHead(204).end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+
+  const baseUrl = `http://127.0.0.1:${provider.address().port}/v1`;
+  const catalog = buildCatalog([
+    { id: 'none', name: 'None', baseUrl, apiKey: 'secret', authPolicy: { type: 'none' }, models: [{ model: 'model' }] },
+    { id: 'header', name: 'Header', baseUrl, apiKey: 'secret', authPolicy: { type: 'x-api-key', header: 'x-provider-key' }, models: [{ model: 'model' }] },
+    { id: 'query', name: 'Query', baseUrl, apiKey: 'secret', authPolicy: { type: 'api-key', query: 'api_key' }, models: [{ model: 'model' }] },
+  ]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+
+  try {
+    for (const id of ['none', 'header', 'query']) {
+      const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: `byok-${id}-model`, messages: [] }),
+      });
+      assert.equal(response.status, 204);
+    }
+    assert.equal(received[0].headers.authorization, undefined);
+    assert.equal(received[1].headers['x-provider-key'], 'secret');
+    assert.equal(received[1].headers.authorization, undefined);
+    assert.equal(received[2].path, '/v1/chat/completions?api_key=secret');
+    assert.equal(received[2].headers.authorization, undefined);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('the default OpenAI adapter preserves a tool stream request and response bytes', async () => {
   const frames = [
     'data: {"id":"chat-1","choices":[{"delta":{"content":"Checking "}}]}\n\n',

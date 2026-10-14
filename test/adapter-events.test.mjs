@@ -129,13 +129,16 @@ test('rejects invalid event shapes and contradictory completed tools', () => {
 });
 
 test('accepts metadata namespaces that overlap object prototype names', () => {
+  const metadata = Object.create(null);
+  metadata.__proto__ = { value: 1 };
   const assembled = assembleAdapterEvents([
-    { type: 'metadata', namespace: '__proto__', data: { value: 1 } },
-    { type: 'metadata', namespace: 'constructor', data: { value: 2 } },
+    { type: 'text', text: 'safe', metadata },
+    { type: 'metadata', namespace: '__proto__', data: { value: 2 } },
+    { type: 'metadata', namespace: 'constructor', data: { value: 3 } },
   ]);
 
-  assert.deepEqual(assembled.metadata.__proto__, [{ value: 1 }]);
-  assert.deepEqual(assembled.metadata.constructor, [{ value: 2 }]);
+  assert.deepEqual(assembled.metadata.__proto__, [{ value: 1 }, { value: 2 }]);
+  assert.deepEqual(assembled.metadata.constructor, [{ value: 3 }]);
 });
 
 test('typed errors validate categories and produce normalized events', () => {
