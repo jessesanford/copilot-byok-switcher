@@ -18,14 +18,15 @@ const ERROR_CATEGORIES = new Set([
   'timeout',
   'cancelled',
   'upstream',
+  'truncated',
   'malformed-response',
   'unsupported',
   'unknown',
 ]);
 
 export class AdapterEventError extends Error {
-  constructor(message, { category = 'unknown', status, retryable = false, metadata } = {}) {
-    super(message);
+  constructor(message, { category = 'unknown', status, retryable = false, metadata, cause } = {}) {
+    super(message, cause === undefined ? {} : { cause });
     this.name = 'AdapterEventError';
     if (!ERROR_CATEGORIES.has(category)) {
       throw new TypeError(`Unknown adapter error category "${category}".`);

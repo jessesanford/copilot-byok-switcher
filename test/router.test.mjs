@@ -271,7 +271,7 @@ test('an unknown BYOK id fails clearly instead of reaching GitHub', async () => 
   }
 });
 
-test('a provider that accepts the connection and stalls does not hang forever', async () => {
+test('a provider timeout emits exactly one typed timeout event without secrets', async () => {
   process.env.COPILOT_BYOK_PROVIDER_TIMEOUT_MS = '300';
   const { createRouter: freshRouter } = await import(`../src/router.mjs?timeout-case`);
 
@@ -286,8 +286,10 @@ test('a provider that accepts the connection and stalls does not hang forever', 
     models: [{ model: 'slow-model' }],
   }]);
 
+  const events = [];
   const router = freshRouter({
     catalog,
+    onEvent: (event) => events.push(event),
     upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
   });
   await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
@@ -301,6 +303,10 @@ test('a provider that accepts the connection and stalls does not hang forever', 
 
     assert.equal(response.status, 502);
     assert.match((await response.json()).error.message, /no data for/);
+    const errors = events.filter((event) => event.type === 'error');
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].error.category, 'timeout');
+    assert.ok(!JSON.stringify(errors).includes('k'));
   } finally {
     delete process.env.COPILOT_BYOK_PROVIDER_TIMEOUT_MS;
     router.closeAllConnections();
@@ -344,7 +350,10 @@ test('a provider that dies mid-stream ends the response instead of hanging', asy
     // Must settle rather than hang: the body ends even though the provider vanished.
     const text = await response.text();
     assert.match(text, /par$/);
-    assert.ok(events.some((event) => /interrupted|aborted/.test(event.message || '')));
+    const errors = events.filter((event) => event.type === 'error');
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].error.category, 'truncated');
+    assert.ok(!JSON.stringify(errors).includes('secret-key'));
   } finally {
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));
@@ -591,6 +600,112 @@ test('when the CLI starts sending an effort, the user choice wins over the confi
   } finally {
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('router rejects a request body over 64 MiB with one typed terminal error', async () => {
+  const events = [];
+  const router = createRouter({ catalog: buildCatalog([]), onEvent: (event) => events.push(event), transport: http,
+    upstream: createUpstreamResolver({ explicit: 'http://127.0.0.1:1' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/anything`, {
+      method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: Buffer.alloc(64 * 1024 * 1024 + 1),
+    });
+    assert.equal(response.status, 413);
+    assert.equal(events.filter((event) => event.type === 'error').length, 1);
+    assert.equal(events.find((event) => event.type === 'error').error.category, 'invalid-request');
+  } finally { await router.shutdown(); }
+});
+
+test('GET /models rejects an 8 MiB catalog with one typed terminal error', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('x'.repeat(8 * 1024 * 1024 + 1));
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const events = [];
+  const router = createRouter({ catalog: buildCatalog([]), onEvent: (event) => events.push(event), transport: http,
+    upstream: createUpstreamResolver({ explicit: `http://127.0.0.1:${upstream.address().port}` }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/models`);
+    assert.equal(response.status, 502);
+    const error = events.find((event) => event.type === 'error');
+    assert.equal(error.error.category, 'invalid-request');
+    assert.equal(events.filter((event) => event.type === 'error').length, 1);
+  } finally { await router.shutdown(); await new Promise((resolve) => upstream.close(resolve)); }
+});
+
+test('client disconnect cancels the provider once and emits no post-cancel terminal event', async () => {
+  let aborts = 0;
+  let providerStarted;
+  const providerReady = new Promise((resolve) => { providerStarted = resolve; });
+  const provider = http.createServer((req, res) => {
+    providerStarted();
+    req.on('aborted', () => { aborts += 1; });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: partial\\n\\n');
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const events = [];
+  const catalog = buildCatalog([{ id: 'cancel', name: 'Cancel', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'secret', models: [{ model: 'm' }] }]);
+  const router = createRouter({ catalog, onEvent: (event) => events.push(event), upstream: createUpstreamResolver({ explicit: 'http://127.0.0.1:1' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  const request = http.request({ hostname: '127.0.0.1', port: router.address().port, path: '/chat/completions', method: 'POST', headers: { 'content-type': 'application/json' } });
+  request.end(JSON.stringify({ model: 'byok-cancel-m', messages: [] }));
+  await providerReady;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  request.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(aborts, 1);
+  assert.ok(events.every((event) => event.type !== 'error' || event.error?.category === 'cancelled'));
+  await router.shutdown(); await new Promise((resolve) => provider.close(resolve));
+});
+
+test('shutdown aborts active work before sockets and is idempotent', async () => {
+  let aborts = 0;
+  let providerStarted;
+  const providerReady = new Promise((resolve) => { providerStarted = resolve; });
+  const provider = http.createServer((req) => {
+    providerStarted();
+    req.on('aborted', () => { aborts += 1; });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{ id: 'stop', name: 'Stop', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'secret', models: [{ model: 'm' }] }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'http://127.0.0.1:1' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'byok-stop-m', messages: [] }) }).catch(() => {});
+  await providerReady;
+  const first = router.shutdown();
+  const second = router.shutdown();
+  assert.equal(first, second);
+  await Promise.all([first, second]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(aborts, 1);
+  await new Promise((resolve) => provider.close(resolve));
+});
+
+test('provider status failures preserve raw response bytes and headers', async () => {
+  const body = JSON.stringify({ error: { message: 'provider detail' } });
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '7' });
+    res.end(body);
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const events = [];
+  const catalog = buildCatalog([{ id: 'reject', name: 'Reject', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'secret-key', models: [{ model: 'reject-model' }] }]);
+  const router = createRouter({ catalog, onEvent: (event) => events.push(event), upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'byok-reject-reject-model', messages: [] }) });
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get('retry-after'), '7');
+    assert.equal(await response.text(), body);
+    assert.ok(events.every((event) => !JSON.stringify(event).includes('secret-key')));
+  } finally {
+    await router.shutdown();
     await new Promise((resolve) => provider.close(resolve));
   }
 });

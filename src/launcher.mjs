@@ -102,8 +102,12 @@ export function startRouter({ providers, upstreamOrigin, onEvent, port = 0, host
         close: () => new Promise((done) => {
           // Copilot keeps connections alive: without closing them explicitly the
           // process would never terminate.
-          server.closeAllConnections();
-          server.close(done);
+          if (typeof server.shutdown === 'function') {
+            server.shutdown().then(done, done);
+          } else {
+            server.closeAllConnections();
+            server.close(done);
+          }
         }),
       });
     });

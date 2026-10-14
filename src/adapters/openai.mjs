@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 
+import { AdapterEventError } from './events.mjs';
+
 const EFFORT_LADDER = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
 const rejectedEfforts = new Map();
 
@@ -29,7 +31,7 @@ function applyAuthPolicy({ target, headers, apiKey, policy }) {
   }
 }
 
-function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutMs }) {
+function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutMs, signal }) {
   const { provider, model } = route;
   const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`);
   const client = target.protocol === 'https:' ? https : http;
@@ -54,13 +56,17 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
 
   onEvent({ type: 'route', provider: provider.id, model: model.model, adapter: 'openai' });
 
-  const providerReq = client.request({
+  const providerReq = client.request({ signal,
     hostname: target.hostname,
     port: target.port || (target.protocol === 'https:' ? 443 : 80),
     path: `${target.pathname}${target.search}`,
     method: 'POST',
     headers,
   }, (providerRes) => {
+    if (signal?.aborted || res.destroyed) {
+      providerRes.resume();
+      return;
+    }
     if (providerRes.statusCode === 400 && outbound.reasoning_effort) {
       const key = `${provider.id}:${model.model}`;
       const rejected = rejectedEfforts.get(key) || new Set();
@@ -75,22 +81,36 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
           + (fallback ? `, retrying with "${fallback}"` : ', retrying without it'),
       });
       providerRes.resume();
-      return forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutMs });
+      if (!signal?.aborted && !res.destroyed) {
+        return forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutMs, signal });
+      }
+      return;
     }
 
     res.writeHead(providerRes.statusCode, providerRes.headers);
     providerRes.pipe(res);
     endOnBrokenSource(providerRes, res, (message) => {
-      onEvent({ type: 'error', provider: provider.id, message });
+      if (signal?.aborted || res.destroyed) return;
+      const truncated = new AdapterEventError(message, { category: 'truncated', retryable: true });
+      onEvent({ type: 'error', provider: provider.id, message, error: truncated.toEvent().error });
     });
   });
 
+  let timedOut = false;
   providerReq.setTimeout(providerIdleTimeoutMs, () => {
-    providerReq.destroy(new Error(`no data for ${Math.round(providerIdleTimeoutMs / 1000)}s`));
+    timedOut = true;
+    providerReq.destroy(new Error('provider idle timeout'));
   });
   providerReq.on('error', (error) => {
-    onEvent({ type: 'error', provider: provider.id, message: error.message });
-    respondJson(res, 502, { error: { message: `${provider.name} is unreachable: ${error.message}` } });
+    if (signal?.aborted || res.destroyed) return;
+    const category = timedOut ? 'timeout' : error.code === 'ABORT_ERR' ? 'cancelled' : 'upstream';
+    const safe = new AdapterEventError(
+      timedOut ? `Provider produced no data for ${Math.round(providerIdleTimeoutMs / 1000)} seconds.`
+        : category === 'cancelled' ? 'Request cancelled.' : `${provider.name} is unreachable.`,
+      { category, retryable: category === 'timeout' || category === 'upstream', cause: error },
+    );
+    onEvent({ type: 'error', provider: provider.id, error: safe.toEvent().error });
+    respondJson(res, safe.status || 502, { error: safe.toEvent().error });
   });
   res.on('close', () => {
     if (!res.writableEnded) providerReq.destroy();
@@ -99,9 +119,12 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
 }
 
 function endOnBrokenSource(source, res, report) {
+  let finished = false;
   const finish = (reason) => {
+    if (finished) return;
+    finished = true;
     report(reason);
-    if (!res.writableEnded) res.end();
+    if (!res.writableEnded && !res.destroyed) res.end();
   };
   source.on('error', (error) => finish(`stream interrupted: ${error.message}`));
   source.on('aborted', () => finish('stream aborted by the remote end'));

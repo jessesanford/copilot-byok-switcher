@@ -14,6 +14,7 @@
 import http from 'node:http';
 import https from 'node:https';
 
+import { AdapterEventError } from './adapters/events.mjs';
 import { createOpenAIAdapter } from './adapters/openai.mjs';
 import { createAdapterRegistry, UnsupportedAdapterError } from './adapters/registry.mjs';
 import { isByokModelId } from './catalog.mjs';
@@ -40,25 +41,55 @@ const defaultAdapters = createAdapterRegistry([
  * @param {function} [options.onEvent] Diagnostic callback: ({type, ...}) => void
  * @param {object} [options.adapters] Adapter registry with a resolve(kind) method.
  */
-export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, adapters = defaultAdapters }) {
+export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, adapters = defaultAdapters, transport = https }) {
   const readCatalog = typeof catalog === 'function' ? catalog : () => catalog;
+  const controllers = new Set();
 
-  return http.createServer((req, res) => {
-    collectBody(req)
+  const server = http.createServer((req, res) => {
+    const controller = new AbortController();
+    controllers.add(controller);
+    const cleanup = () => {
+      controllers.delete(controller);
+      req.removeListener('aborted', abort);
+      res.removeListener('close', abort);
+      res.removeListener('finish', cleanup);
+    };
+    const abort = () => controller.abort();
+    controller.signal.addEventListener('abort', cleanup, { once: true });
+    req.once('aborted', abort);
+    res.once('close', abort);
+    res.once('finish', cleanup);
+    collectBody(req, MAX_BODY_BYTES, controller.signal)
       .then(async (body) => {
+        if (controller.signal.aborted) return;
         const origin = await resolver.resolve(req.headers.authorization);
-        return handle({ req, res, body, catalog: await readCatalog(), upstream: new URL(origin), onEvent, adapters });
+        return handle({ req, res, body, catalog: await readCatalog(), upstream: new URL(origin), onEvent, adapters, signal: controller.signal, transport });
       })
       .catch((error) => {
-        onEvent({ type: 'error', message: error.message });
-        respondJson(res, 502, { error: { message: `copilot-byok router: ${error.message}` } });
+        if (controller.signal.aborted || res.destroyed) return;
+        onEvent({ type: 'error', error: error instanceof AdapterEventError ? error.toEvent().error : { category: 'upstream', message: 'Upstream request failed.', retryable: true } });
+        respondJson(res, error instanceof AdapterEventError && error.status || 502, { error: { message: error instanceof AdapterEventError ? error.message : 'Upstream request failed.' } });
       });
   });
+
+  let shutdown;
+  server.shutdown = () => {
+    if (!shutdown) {
+      shutdown = new Promise((resolve, reject) => {
+        for (const controller of controllers) controller.abort();
+        server.close((error) => error ? reject(error) : resolve());
+        server.closeAllConnections();
+      });
+    }
+    return shutdown;
+  };
+
+  return server;
 }
 
-async function handle({ req, res, body, catalog, upstream, onEvent, adapters }) {
+async function handle({ req, res, body, catalog, upstream, onEvent, adapters, signal, transport }) {
   if (req.method === 'GET' && isModelsPath(req.url)) {
-    return injectModels({ req, res, body, catalog, upstream, onEvent });
+    return injectModels({ req, res, body, catalog, upstream, onEvent, signal, transport });
   }
 
   if (req.method === 'POST' && body.length) {
@@ -80,11 +111,11 @@ async function handle({ req, res, body, catalog, upstream, onEvent, adapters }) 
           error: { code: error.code, adapter: error.kind, message: error.message },
         });
       }
-      return adapter.forward({ req, res, payload: parsed, route, onEvent });
+      return adapter.forward({ req, res, payload: parsed, route, onEvent, signal });
     }
   }
 
-  return passthrough({ req, res, body, upstream, onEvent });
+  return passthrough({ req, res, body, upstream, onEvent, signal, transport });
 }
 
 function isModelsPath(url) {
@@ -93,14 +124,15 @@ function isModelsPath(url) {
 
 // ------------------------------------------------------------------ GET /models
 
-function injectModels({ req, res, body, catalog, upstream, onEvent }) {
+function injectModels({ req, res, body, catalog, upstream, onEvent, signal, transport = https }) {
   const headers = { ...req.headers, host: upstream.host };
   delete headers['accept-encoding']; // the response must be readable to be extended
 
-  const upstreamReq = https.request(
-    { hostname: upstream.hostname, port: upstream.port || 443, path: req.url, method: 'GET', headers },
+  const upstreamReq = transport.request(
+    { hostname: upstream.hostname, port: upstream.port || 443, path: req.url, method: 'GET', headers, signal },
     (upstreamRes) => {
       readAll(upstreamRes, MAX_MODELS_BYTES).then((raw) => {
+        if (signal?.aborted || res.destroyed) return;
         const merged = mergeModels(raw.toString('utf8'), catalog.entries);
         onEvent({
           type: 'models',
@@ -114,15 +146,20 @@ function injectModels({ req, res, body, catalog, upstream, onEvent }) {
         res.writeHead(upstreamRes.statusCode, outHeaders);
         res.end(merged.payload);
       }).catch((error) => {
-        onEvent({ type: 'error', message: `GET /models: ${error.message}` });
-        res.writeHead(502).end();
+        if (signal?.aborted || res.destroyed) return;
+        const safe = error instanceof AdapterEventError ? error : new AdapterEventError('Upstream model catalog request failed.', { category: 'upstream', retryable: true, cause: error });
+        onEvent({ type: 'error', path: '/models', error: safe.toEvent().error });
+        respondJson(res, safe.status || 502, { error: { message: 'Upstream model catalog request failed.' } });
       });
     }
   );
 
   upstreamReq.on('error', (error) => {
-    onEvent({ type: 'error', message: `GET /models: ${error.message}` });
-    res.writeHead(502).end();
+    if (signal?.aborted || res.destroyed) return;
+    const category = error.code === 'ABORT_ERR' ? 'cancelled' : 'upstream';
+    const safe = new AdapterEventError(category === 'cancelled' ? 'Request cancelled.' : 'Upstream model catalog request failed.', { category, retryable: category === 'upstream', cause: error });
+    onEvent({ type: 'error', path: '/models', error: safe.toEvent().error });
+    respondJson(res, safe.status || 502, { error: { message: 'Upstream model catalog request failed.' } });
   });
   upstreamReq.end(body);
 }
@@ -152,22 +189,25 @@ export function mergeModels(payload, entries) {
 
 // ------------------------------------------------------------------ passthrough
 
-function passthrough({ req, res, body, upstream, onEvent }) {
+function passthrough({ req, res, body, upstream, onEvent, signal, transport = https }) {
   const headers = { ...req.headers, host: upstream.host };
-  const upstreamReq = https.request(
-    { hostname: upstream.hostname, port: upstream.port || 443, path: req.url, method: req.method, headers },
+  const upstreamReq = transport.request(
+    { hostname: upstream.hostname, port: upstream.port || 443, path: req.url, method: req.method, headers, signal },
     (upstreamRes) => {
       res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
       upstreamRes.pipe(res);
       endOnBrokenSource(upstreamRes, res, (message) => {
-        onEvent({ type: 'error', path: req.url, message });
+        onEvent({ type: 'error', path: req.url, error: { category: 'truncated', message, retryable: true } });
       });
     }
   );
 
   upstreamReq.on('error', (error) => {
-    onEvent({ type: 'error', path: req.url, message: error.message });
-    res.writeHead(502).end();
+    if (signal?.aborted || res.destroyed) return;
+    const category = error.code === 'ABORT_ERR' ? 'cancelled' : 'upstream';
+    const safe = new AdapterEventError(category === 'cancelled' ? 'Request cancelled.' : 'Upstream request failed.', { category, retryable: category === 'upstream', cause: error });
+    onEvent({ type: 'error', path: req.url, error: safe.toEvent().error });
+    respondJson(res, 502, { error: { message: 'Upstream request failed.' } });
   });
 
   res.on('close', () => {
@@ -185,30 +225,51 @@ function passthrough({ req, res, body, upstream, onEvent }) {
  * listener discards the error entirely — together that means a silent hang.
  */
 function endOnBrokenSource(source, res, report) {
+  let finished = false;
   const finish = (reason) => {
+    if (finished) return;
+    finished = true;
     report(reason);
-    if (!res.writableEnded) res.end();
+    if (!res.writableEnded && !res.destroyed) res.end();
   };
 
   source.on('error', (error) => finish(`stream interrupted: ${error.message}`));
   source.on('aborted', () => finish('stream aborted by the remote end'));
 }
 
-function collectBody(req, maxBytes = MAX_BODY_BYTES) {
+function collectBody(req, maxBytes = MAX_BODY_BYTES, signal) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
-    req.on('data', (chunk) => {
+    let settled = false;
+    const cleanup = () => {
+      signal?.removeEventListener('abort', abort);
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+    };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const abort = () => settle(reject, new AdapterEventError('Request cancelled.', { category: 'cancelled' }));
+    const onData = (chunk) => {
       total += chunk.length;
       if (total > maxBytes) {
-        req.destroy();
-        reject(new Error(`request body exceeded the ${maxBytes}-byte limit`));
+        req.resume();
+        settle(reject, new AdapterEventError(`Request body exceeded the ${maxBytes}-byte limit.`, { category: 'invalid-request', status: 413 }));
         return;
       }
       chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    };
+    const onEnd = () => settle(resolve, Buffer.concat(chunks));
+    const onError = (error) => settle(reject, error);
+    signal?.addEventListener('abort', abort, { once: true });
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onError);
   });
 }
 
@@ -216,17 +277,38 @@ function readAll(stream, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
-    stream.on('data', (chunk) => {
+    let settled = false;
+    const cleanup = () => {
+      stream.removeListener('data', onData);
+      stream.removeListener('end', onEnd);
+      stream.removeListener('error', onError);
+      stream.removeListener('aborted', onAborted);
+    };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onData = (chunk) => {
       total += chunk.length;
       if (total > maxBytes) {
         stream.destroy();
-        reject(new Error(`response exceeded the ${maxBytes}-byte limit`));
+        settle(reject, new AdapterEventError(`Response exceeded the ${maxBytes}-byte limit.`, { category: 'invalid-request', status: 502 }));
         return;
       }
       chunks.push(chunk);
-    });
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', reject);
+    };
+    const onEnd = () => settle(resolve, Buffer.concat(chunks));
+    const onError = (error) => settle(reject, error);
+    const onAborted = () => settle(reject, new AdapterEventError(
+      total > maxBytes ? `Response exceeded the ${maxBytes}-byte limit.` : 'Upstream response was truncated.',
+      { category: total > maxBytes ? 'invalid-request' : 'truncated', status: total > maxBytes ? 502 : undefined, retryable: total <= maxBytes },
+    ));
+    stream.on('data', onData);
+    stream.once('end', onEnd);
+    stream.once('error', onError);
+    stream.once('aborted', onAborted);
   });
 }
 
