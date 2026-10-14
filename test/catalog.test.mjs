@@ -44,6 +44,50 @@ test('catalog entries declare the capabilities the Copilot harness needs', () =>
   const route = routes.get(large.id);
   assert.equal(route.provider.id, 'acme');
   assert.equal(route.model.model, 'acme-large');
+  assert.equal(route.adapterKind, 'openai');
+  assert.equal(route.endpointFamily, 'chat-completions');
+  assert.equal(route.wireModel, 'acme-large');
+  assert.deepEqual(route.authPolicy, { type: 'bearer' });
+  assert.equal(route.capabilities, large.capabilities);
+  assert.ok(Object.isFrozen(route));
+  assert.ok(Object.isFrozen(route.provider));
+  assert.ok(Object.isFrozen(route.model));
+  assert.ok(Object.isFrozen(route.capabilities));
+  assert.ok(Object.isFrozen(route.authPolicy));
+});
+
+test('declared route metadata is validated, model-scoped, and immutable', () => {
+  const { routes } = buildCatalog([{
+    id: 'native', name: 'Native', baseUrl: 'https://native.test/v1', apiKey: 'k',
+    adapterKind: 'anthropic', endpointFamily: 'messages', authPolicy: { type: 'x-api-key', header: 'x-api-key' },
+    models: [{
+      model: 'picker-name', wireModel: 'account/deployment', adapterKind: 'gemini',
+      endpointFamily: 'generate-content', authPolicy: { type: 'api-key', query: 'key' },
+    }],
+  }]);
+
+  const route = routes.get('byok-native-picker-name');
+  assert.equal(route.adapterKind, 'gemini');
+  assert.equal(route.endpointFamily, 'generate-content');
+  assert.equal(route.wireModel, 'account/deployment');
+  assert.deepEqual(route.authPolicy, { type: 'api-key', query: 'key' });
+  assert.throws(() => { route.wireModel = 'changed'; }, TypeError);
+});
+
+test('invalid route metadata is rejected while building the catalog', () => {
+  const base = { id: 'p', name: 'P', baseUrl: 'https://x.test/v1', apiKey: 'k' };
+  assert.throws(
+    () => buildCatalog([{ ...base, endpointFamily: 'Chat Completions', models: [{ model: 'm' }] }]),
+    /endpoint family must be a lowercase identifier/
+  );
+  assert.throws(
+    () => buildCatalog([{ ...base, models: [{ model: 'm', wireModel: ' ' }] }]),
+    /requires a non-empty wire model/
+  );
+  assert.throws(
+    () => buildCatalog([{ ...base, authPolicy: { type: 'cookie' }, models: [{ model: 'm' }] }]),
+    /auth policy type "cookie" is unsupported/
+  );
 });
 
 test('entries never leak credentials', () => {
@@ -51,10 +95,9 @@ test('entries never leak credentials', () => {
   assert.ok(!JSON.stringify(entries).includes('secret'));
 });
 
-test('duplicate model ids are collapsed', () => {
+test('duplicate route ids are rejected', () => {
   const twin = { ...provider, models: [provider.models[0], provider.models[0]] };
-  const { entries } = buildCatalog([twin]);
-  assert.equal(entries.length, 1);
+  assert.throws(() => buildCatalog([twin]), /Duplicate route id "byok-acme-acme-large"/);
 });
 
 test('only providers with models and credentials are activated', () => {
@@ -111,15 +154,14 @@ test('the shipped catalog never advertises more than a model can hold', async ()
   }
 });
 
-test('models whose names collide are reported rather than dropped in silence', () => {
+test('models whose names collide are rejected and reported', () => {
   const events = [];
-  const { entries } = buildCatalog([{
+  assert.throws(() => buildCatalog([{
     id: 'p', name: 'P', baseUrl: 'https://x.test/v1', apiKey: 'k',
     models: [{ model: 'gpt-4.1' }, { model: 'gpt-4-1' }],
-  }], (event) => events.push(event));
+  }], (event) => events.push(event)), /Duplicate route id "byok-p-gpt-4-1"/);
 
-  assert.equal(entries.length, 1);
-  assert.match(events[0].message, /collide as byok-p-gpt-4-1/);
+  assert.match(events[0].message, /Duplicate route id "byok-p-gpt-4-1"/);
 });
 
 test('the effort selector is declared only when explicitly enabled', () => {

@@ -22,7 +22,7 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
   const { provider, model } = route;
   const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`);
   const client = target.protocol === 'https:' ? https : http;
-  const outbound = { ...payload, model: model.model };
+  const outbound = { ...payload, model: route.wireModel };
 
   const configured = model.reasoningEffort || provider.reasoningEffort;
   if (configured && outbound.reasoning_effort === undefined) {

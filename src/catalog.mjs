@@ -3,7 +3,11 @@
 // The shape mirrors GitHub's own model entries: if one declares capabilities the model
 // does not have (tool calling, streaming), the harness fails mid-session.
 
+import { DEFAULT_ADAPTER_KIND } from './adapters/registry.mjs';
+
 const ID_PREFIX = 'byok';
+const DEFAULT_ENDPOINT_FAMILY = 'chat-completions';
+const IDENTIFIER_PATTERN = /^[a-z][a-z0-9-]*$/;
 
 // The levels Copilot offers. Overridable per model, since they differ: Claude
 // Sonnet 4.6 has no `xhigh`, Gemini stops at `high`.
@@ -11,7 +15,7 @@ const DEFAULT_EFFORT_LEVELS = ['low', 'medium', 'high'];
 
 /**
  * @param {object[]} providers   Already-resolved providers (with apiKey where needed).
- * @returns {{entries: object[], routes: Map<string, {provider: object, model: object, adapterKind?: string}>}}
+ * @returns {{entries: object[], routes: Map<string, object>}}
  */
 export function buildCatalog(providers, onEvent = () => {}) {
   const entries = [];
@@ -24,18 +28,14 @@ export function buildCatalog(providers, onEvent = () => {}) {
       // Distinct names can slugify to the same id (gpt-4.1 and gpt-4-1). Dropping
       // the second silently would make a configured model vanish from the picker.
       if (routes.has(id)) {
-        const taken = routes.get(id);
-        if (taken.model.model !== model.model) {
-          onEvent({
-            type: 'error',
-            message: `${provider.id}: "${model.model}" and "${taken.model.model}" collide as ${id}; keeping the first`,
-          });
-        }
-        continue;
+        const message = `Duplicate route id "${id}" for ${provider.id}:${model.model}.`;
+        onEvent({ type: 'error', message });
+        throw new TypeError(message);
       }
 
-      routes.set(id, { provider, model, adapterKind: model.adapterKind ?? provider.adapterKind });
-      entries.push(buildEntry({ id, provider, model }));
+      const entry = buildEntry({ id, provider, model });
+      routes.set(id, buildRoute({ id, provider, model, entry }));
+      entries.push(entry);
     }
   }
 
@@ -53,6 +53,67 @@ export function buildModelId(providerId, modelName) {
 
 export function isByokModelId(value) {
   return typeof value === 'string' && value.startsWith(`${ID_PREFIX}-`);
+}
+
+function buildRoute({ id, provider, model, entry }) {
+  const adapterKind = routeIdentifier(model.adapterKind ?? provider.adapterKind ?? DEFAULT_ADAPTER_KIND, 'adapter kind', id);
+  const endpointFamily = routeIdentifier(
+    model.endpointFamily ?? provider.endpointFamily ?? DEFAULT_ENDPOINT_FAMILY,
+    'endpoint family',
+    id
+  );
+  const wireModel = requiredRouteString(model.wireModel ?? model.model, 'wire model', id);
+  const authPolicy = normalizeAuthPolicy(model.authPolicy ?? provider.authPolicy, provider, id);
+
+  return deepFreeze({
+    provider: cloneValue(provider),
+    model: cloneValue(model),
+    adapterKind,
+    endpointFamily,
+    wireModel,
+    capabilities: entry.capabilities,
+    authPolicy,
+  });
+}
+
+function routeIdentifier(value, field, id) {
+  const normalized = requiredRouteString(value, field, id);
+  if (!IDENTIFIER_PATTERN.test(normalized)) {
+    throw new TypeError(`Route ${id} ${field} must be a lowercase identifier containing only letters, numbers, and hyphens.`);
+  }
+  return normalized;
+}
+
+function requiredRouteString(value, field, id) {
+  if (typeof value !== 'string' || !value.trim()) throw new TypeError(`Route ${id} requires a non-empty ${field}.`);
+  return value.trim();
+}
+
+function normalizeAuthPolicy(policy, provider, id) {
+  if (policy == null) {
+    return Object.freeze({ type: provider.apiKey ? 'bearer' : 'none' });
+  }
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new TypeError(`Route ${id} auth policy must be an object.`);
+  }
+  const type = routeIdentifier(policy.type, 'auth policy type', id);
+  if (!['none', 'bearer', 'x-api-key', 'api-key'].includes(type)) {
+    throw new TypeError(`Route ${id} auth policy type "${type}" is unsupported.`);
+  }
+  return deepFreeze({ ...policy, type });
+}
+
+function cloneValue(value) {
+  if (Array.isArray(value)) return value.map(cloneValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, cloneValue(nested)]));
+}
+
+function deepFreeze(value, seen = new Set()) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  for (const nested of Object.values(value)) deepFreeze(nested, seen);
+  return Object.freeze(value);
 }
 
 function buildEntry({ id, provider, model }) {

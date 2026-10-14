@@ -132,6 +132,14 @@ test('the default OpenAI adapter preserves a tool stream request and response by
   }
 });
 
+test('the adapter registry rejects duplicate kinds', () => {
+  const adapter = { kind: 'native', forward() {} };
+  assert.throws(
+    () => createAdapterRegistry([adapter, { ...adapter }]),
+    /Adapter kind "native" is already registered/
+  );
+});
+
 test('createRouter accepts an adapter registry extension', async () => {
   let forwarded = false;
   const catalog = buildCatalog([{
