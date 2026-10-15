@@ -201,8 +201,7 @@ test('Responses requests translate prior assistant tool calls into function call
       }),
     });
     assert.equal(response.status, 200);
-    assert.equal(received.input[1].content[0].type, 'function_call');
-    assert.deepEqual(received.input[1].content[0], { type: 'function_call', call_id: 'call_1', name: 'date', arguments: '{}' });
+    assert.deepEqual(received.input[1], { type: 'function_call', call_id: 'call_1', name: 'date', arguments: '{}' });
     assert.deepEqual(received.input[2], { type: 'function_call_output', call_id: 'call_1', output: '2026-10-15' });
   } finally {
     router.closeAllConnections();

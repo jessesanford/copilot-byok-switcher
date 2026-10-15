@@ -170,13 +170,13 @@ function toResponsesPayload(payload, wireModel) {
 }
 
 function toResponsesInput(messages) {
-  return messages.map((message) => {
+  return messages.flatMap((message) => {
     if (message?.role === 'tool') {
       return { type: 'function_call_output', call_id: message.tool_call_id, output: message.content ?? '' };
     }
     if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) return message;
-    const content = message.content == null ? [] : [{ type: 'output_text', text: message.content }];
-    const items = [...content];
+    const items = [];
+    if (message.content != null) items.push({ role: 'assistant', content: [{ type: 'output_text', text: message.content }] });
     for (const call of message.tool_calls) {
       const fn = call?.function;
       if (!fn?.name) continue;
@@ -187,7 +187,7 @@ function toResponsesInput(messages) {
         arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
       });
     }
-    return { role: 'assistant', content: items };
+    return items;
   });
 }
 
