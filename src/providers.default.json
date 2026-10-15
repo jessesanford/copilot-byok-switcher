@@ -51,6 +51,7 @@
       "name": "Anthropic",
       "baseUrl": "https://api.anthropic.com/v1",
       "modelsUrl": "https://api.anthropic.com/v1/models",
+      "adapterKind": "anthropic",
       "apiKeyEnv": [
         "ANTHROPIC_API_KEY",
         "COPILOT_BYOK_ANTHROPIC_API_KEY"

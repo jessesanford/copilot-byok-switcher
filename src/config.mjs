@@ -95,7 +95,7 @@ function normalizeProvider(provider, env, index, secrets = {}) {
   const transport = provider.transport == null
     ? undefined
     : requiredString(provider.transport, `Provider ${name} transport must be a non-empty string`).toLowerCase();
-  const adapterKind = normalizeAdapterKind(provider.adapterKind, `Provider ${name}`);
+  const adapterKind = normalizeAdapterKind(provider.adapterKind ?? (type === 'anthropic' ? 'anthropic' : undefined), `Provider ${name}`);
   const azureApiVersion = provider.azureApiVersion == null
     ? undefined
     : requiredString(provider.azureApiVersion, `Provider ${name} azureApiVersion must be a non-empty string`);

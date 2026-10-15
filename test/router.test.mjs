@@ -219,7 +219,7 @@ test('an unavailable explicit adapter fails before provider traffic', async () =
   await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
   const catalog = buildCatalog([{
     id: 'native', name: 'Native', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
-    apiKey: 'k', adapterKind: 'anthropic', models: [{ model: 'native-model' }],
+    apiKey: 'k', adapterKind: 'unavailable', models: [{ model: 'native-model' }],
   }]);
   const router = createRouter({
     catalog,
@@ -235,8 +235,8 @@ test('an unavailable explicit adapter fails before provider traffic', async () =
     assert.equal(response.status, 422);
     assert.deepEqual(await response.json(), { error: {
       code: 'unsupported_adapter',
-      adapter: 'anthropic',
-      message: 'Unsupported provider adapter "anthropic". Register it before routing requests.',
+      adapter: 'unavailable',
+      message: 'Unsupported provider adapter "unavailable". Register it before routing requests.',
     } });
     assert.equal(providerRequests, 0);
   } finally {
