@@ -33,12 +33,13 @@ function applyAuthPolicy({ target, headers, apiKey, policy }) {
 
 function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutMs, signal }) {
   const { provider, model } = route;
-  const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`);
+  const responses = route.endpointFamily === 'responses';
+  const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/${responses ? 'responses' : 'chat/completions'}`);
   const client = target.protocol === 'https:' ? https : http;
-  const outbound = { ...payload, model: route.wireModel };
+  const outbound = responses ? toResponsesPayload(payload, route.wireModel) : { ...payload, model: route.wireModel };
 
   const configured = model.reasoningEffort || provider.reasoningEffort;
-  if (configured && outbound.reasoning_effort === undefined) {
+  if (!responses && configured && outbound.reasoning_effort === undefined) {
     const rejected = rejectedEfforts.get(`${provider.id}:${model.model}`) || new Set();
     let effort = configured;
     while (effort && rejected.has(effort)) effort = nextEffortDown(effort);
@@ -67,7 +68,7 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
       providerRes.resume();
       return;
     }
-    if (providerRes.statusCode === 400 && outbound.reasoning_effort) {
+      if (!responses && providerRes.statusCode === 400 && outbound.reasoning_effort) {
       const key = `${provider.id}:${model.model}`;
       const rejected = rejectedEfforts.get(key) || new Set();
       rejected.add(outbound.reasoning_effort);
@@ -87,8 +88,13 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
       return;
     }
 
-    res.writeHead(providerRes.statusCode, providerRes.headers);
-    providerRes.pipe(res);
+    if (responses && providerRes.statusCode >= 200 && providerRes.statusCode < 300
+      && String(providerRes.headers['content-type'] || '').includes('text/event-stream')) {
+      relayResponsesStream(providerRes, res, route.wireModel);
+    } else {
+      res.writeHead(providerRes.statusCode, providerRes.headers);
+      providerRes.pipe(res);
+    }
     endOnBrokenSource(providerRes, res, (message) => {
       if (signal?.aborted || res.destroyed) return;
       const truncated = new AdapterEventError(message, { category: 'truncated', retryable: true });
@@ -116,6 +122,43 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
     if (!res.writableEnded) providerReq.destroy();
   });
   providerReq.end(body);
+}
+
+function relayResponsesStream(source, res, model) {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  let buffer = '';
+  source.setEncoding('utf8');
+  source.on('data', (chunk) => {
+    buffer += chunk;
+    const frames = buffer.split(/\n\n/);
+    buffer = frames.pop();
+    for (const frame of frames) {
+      const line = frame.split('\n').find((entry) => entry.startsWith('data:'));
+      if (!line) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') {
+        res.write('data: [DONE]\n\n');
+        continue;
+      }
+      let event;
+      try { event = JSON.parse(data); } catch { continue; }
+      if (event.type === 'response.output_text.delta') {
+        res.write(`data: ${JSON.stringify({ id: event.response?.id || 'response', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: event.delta || '' }, finish_reason: null }] })}\n\n`);
+      }
+    }
+  });
+}
+
+function toResponsesPayload(payload, wireModel) {
+  const outbound = { ...payload, model: wireModel };
+  if (outbound.messages && !outbound.input) {
+    outbound.input = outbound.messages;
+    delete outbound.messages;
+  }
+  delete outbound.reasoning_effort;
+  delete outbound.temperature;
+  delete outbound.top_p;
+  return outbound;
 }
 
 function endOnBrokenSource(source, res, report) {
