@@ -152,7 +152,7 @@ function relayResponsesStream(source, res, model) {
 function toResponsesPayload(payload, wireModel) {
   const outbound = { ...payload, model: wireModel };
   if (outbound.messages && !outbound.input) {
-    outbound.input = outbound.messages;
+    outbound.input = toResponsesInput(outbound.messages);
     delete outbound.messages;
   }
   delete outbound.reasoning_effort;
@@ -166,6 +166,28 @@ function toResponsesPayload(payload, wireModel) {
     });
   }
   return outbound;
+}
+
+function toResponsesInput(messages) {
+  return messages.map((message) => {
+    if (message?.role === 'tool') {
+      return { type: 'function_call_output', call_id: message.tool_call_id, output: message.content ?? '' };
+    }
+    if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) return message;
+    const content = message.content == null ? [] : [{ type: 'output_text', text: message.content }];
+    const items = [...content];
+    for (const call of message.tool_calls) {
+      const fn = call?.function;
+      if (!fn?.name) continue;
+      items.push({
+        type: 'function_call',
+        call_id: call.id,
+        name: fn.name,
+        arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
+      });
+    }
+    return { role: 'assistant', content: items };
+  });
 }
 
 function endOnBrokenSource(source, res, report) {

@@ -170,6 +170,47 @@ test('the default OpenAI adapter preserves a tool stream request and response by
   }
 });
 
+test('Responses requests translate prior assistant tool calls into function call items', async () => {
+  let received;
+  const provider = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'response-1', output: [] }));
+    });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses', name: 'Responses', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6.1-sol', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-gpt-6-1-sol',
+        messages: [
+          { role: 'user', content: 'What is today\'s date?' },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'date', arguments: '{}' } }] },
+          { role: 'tool', tool_call_id: 'call_1', content: '2026-10-15' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(received.input[1].content[0].type, 'function_call');
+    assert.deepEqual(received.input[1].content[0], { type: 'function_call', call_id: 'call_1', name: 'date', arguments: '{}' });
+    assert.deepEqual(received.input[2], { type: 'function_call_output', call_id: 'call_1', output: '2026-10-15' });
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('the adapter registry rejects duplicate kinds', () => {
   const adapter = { kind: 'native', forward() {} };
   assert.throws(
