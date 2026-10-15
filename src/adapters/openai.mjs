@@ -158,6 +158,7 @@ function toResponsesPayload(payload, wireModel) {
   delete outbound.reasoning_effort;
   delete outbound.temperature;
   delete outbound.top_p;
+  delete outbound.stream_options;
   if (Array.isArray(outbound.tools)) {
     outbound.tools = outbound.tools.map((tool) => {
       if (tool?.type !== 'function' || !tool.function) return tool;
