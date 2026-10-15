@@ -152,9 +152,10 @@ function relayResponsesStream(source, res, model) {
 function toResponsesPayload(payload, wireModel) {
   const outbound = { ...payload, model: wireModel };
   if (outbound.messages && !outbound.input) {
-    outbound.input = toResponsesInput(outbound.messages);
+    outbound.input = outbound.messages;
     delete outbound.messages;
   }
+  if (Array.isArray(outbound.input)) outbound.input = toResponsesInput(outbound.input);
   delete outbound.reasoning_effort;
   delete outbound.temperature;
   delete outbound.top_p;
