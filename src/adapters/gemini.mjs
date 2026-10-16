@@ -448,7 +448,18 @@ function parseGeminiFrame(frame) {
 }
 
 function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model, state) {
+  emitGeminiUsage(value.usageMetadata, state, onEvent);
+  if (value.promptFeedback !== undefined) {
+    if (!value.promptFeedback || typeof value.promptFeedback !== 'object' || Array.isArray(value.promptFeedback)) {
+      throw new Error('The Gemini provider stream contained invalid prompt feedback.');
+    }
+    onEvent({ type: 'metadata', namespace: 'gemini', data: { promptFeedback: value.promptFeedback } });
+  }
   if (!Array.isArray(value.candidates) || !value.candidates.length) {
+    if (value.promptFeedback !== undefined) {
+      lifecycle.fail(geminiBlockedError(value.promptFeedback.blockReason));
+      return;
+    }
     throw new Error('The Gemini provider stream contained an invalid candidate response.');
   }
   for (const [position, candidate] of value.candidates.entries()) {
@@ -460,6 +471,7 @@ function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model, s
       throw new Error('The Gemini provider stream contained an invalid candidate index.');
     }
     const candidateState = geminiCandidateState(state, candidateIndex, res, streamId, model);
+    emitGeminiCandidateMetadata(candidate, candidateIndex, onEvent);
     const parts = candidate.content?.parts;
     if (parts !== undefined) {
       if (!Array.isArray(parts)) {
@@ -470,12 +482,16 @@ function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model, s
       }
     }
     if (candidate.finishReason !== undefined) {
-      if (candidate.finishReason !== 'STOP') {
-        throw new Error('The Gemini provider stream contained an unsupported finish reason.');
+      onEvent({
+        type: 'metadata',
+        namespace: 'gemini',
+        data: { candidate: { index: candidateIndex, finishReason: candidate.finishReason } },
+      });
+      if (isGeminiBlockedFinish(candidate.finishReason)) {
+        lifecycle.fail(geminiBlockedError(candidate.finishReason));
+        return;
       }
-      const mapping = candidateState.hasTools
-        ? { chat: 'tool_calls', normalized: 'tool-calls' }
-        : { chat: 'stop', normalized: 'stop' };
+      const mapping = geminiFinishMapping(candidate.finishReason, candidateState.hasTools);
       onEvent({ type: 'finish', reason: mapping.normalized });
       writeChunk(res, streamId, model, candidateIndex, {}, mapping.chat);
       candidateState.finished = true;
@@ -507,12 +523,19 @@ function handleGeminiPart(part, partIndex, candidateIndex, state, res, onEvent, 
     if (typeof part.text !== 'string') {
       throw new Error('The Gemini provider stream contained invalid text.');
     }
+    if (part.thought === true) {
+      if (part.text) onEvent({ type: 'reasoning', text: part.text });
+      emitGeminiThoughtMetadata(part, partIndex, candidateIndex, onEvent);
+      return;
+    }
+    emitGeminiThoughtMetadata(part, partIndex, candidateIndex, onEvent);
     if (!part.text) return;
     onEvent({ type: 'text', text: part.text });
     writeChunk(res, streamId, model, candidateIndex, { content: part.text });
     return;
   }
   if (part.functionCall !== undefined) {
+    emitGeminiThoughtMetadata(part, partIndex, candidateIndex, onEvent);
     handleGeminiFunctionCall(
       part.functionCall,
       partIndex,
@@ -525,7 +548,100 @@ function handleGeminiPart(part, partIndex, candidateIndex, state, res, onEvent, 
     );
     return;
   }
+  if (part.thoughtSignature !== undefined) {
+    emitGeminiThoughtMetadata(part, partIndex, candidateIndex, onEvent);
+    return;
+  }
   throw new Error('The Gemini provider stream contained an unsupported content part.');
+}
+
+function emitGeminiThoughtMetadata(part, partIndex, candidateIndex, onEvent) {
+  if (part.thoughtSignature === undefined) return;
+  if (typeof part.thoughtSignature !== 'string' || !part.thoughtSignature) {
+    throw new Error('The Gemini provider stream contained an invalid thought signature.');
+  }
+  onEvent({
+    type: 'metadata',
+    namespace: 'gemini',
+    data: {
+      thought: {
+        candidateIndex,
+        partIndex,
+        signature: part.thoughtSignature,
+      },
+    },
+  });
+}
+
+function emitGeminiCandidateMetadata(candidate, index, onEvent) {
+  if (candidate.safetyRatings !== undefined) {
+    if (!Array.isArray(candidate.safetyRatings)) {
+      throw new Error('The Gemini provider stream contained invalid safety ratings.');
+    }
+    onEvent({
+      type: 'metadata',
+      namespace: 'gemini',
+      data: { candidate: { index, safetyRatings: candidate.safetyRatings } },
+    });
+  }
+}
+
+function emitGeminiUsage(native, state, onEvent) {
+  if (native === undefined) return;
+  if (!native || typeof native !== 'object' || Array.isArray(native)) {
+    throw new Error('The Gemini provider stream contained invalid usage metadata.');
+  }
+  const mappings = {
+    promptTokenCount: 'inputTokens',
+    candidatesTokenCount: 'outputTokens',
+    totalTokenCount: 'totalTokens',
+    cachedContentTokenCount: 'cachedInputTokens',
+    thoughtsTokenCount: 'reasoningTokens',
+    toolUsePromptTokenCount: 'toolUsePromptTokens',
+  };
+  const usage = {};
+  for (const [nativeName, normalizedName] of Object.entries(mappings)) {
+    if (native[nativeName] === undefined) continue;
+    if (!Number.isFinite(native[nativeName]) || native[nativeName] < 0) {
+      throw new Error('The Gemini provider stream contained invalid usage metadata.');
+    }
+    usage[normalizedName] = native[nativeName];
+  }
+  const serialized = JSON.stringify(usage);
+  if (serialized === state.lastUsage) return;
+  state.lastUsage = serialized;
+  if (Object.keys(usage).length) onEvent({ type: 'usage', usage });
+}
+
+function geminiFinishMapping(reason, hasTools) {
+  if (reason === 'STOP') {
+    return hasTools
+      ? { chat: 'tool_calls', normalized: 'tool-calls' }
+      : { chat: 'stop', normalized: 'stop' };
+  }
+  if (reason === 'MAX_TOKENS') return { chat: 'length', normalized: 'length' };
+  throw new Error(`The Gemini provider stream contained unsupported finish reason "${reason}".`);
+}
+
+function isGeminiBlockedFinish(reason) {
+  return [
+    'SAFETY',
+    'RECITATION',
+    'LANGUAGE',
+    'BLOCKLIST',
+    'PROHIBITED_CONTENT',
+    'SPII',
+    'MALFORMED_FUNCTION_CALL',
+    'IMAGE_SAFETY',
+  ].includes(reason);
+}
+
+function geminiBlockedError(reason) {
+  return new AdapterEventError('The Gemini provider blocked the response.', {
+    category: 'upstream',
+    retryable: false,
+    metadata: { gemini: { blockedReason: reason || 'UNKNOWN' } },
+  });
 }
 
 function handleGeminiFunctionCall(call, partIndex, candidateIndex, state, res, onEvent, streamId, model) {

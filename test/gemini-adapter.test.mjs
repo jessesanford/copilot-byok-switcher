@@ -368,6 +368,137 @@ test('Gemini adapter assembles ordered parallel function calls with stable ident
   }
 });
 
+test('Gemini adapter preserves thought, usage, safety, and finish metadata without leaking hidden values', async () => {
+  const signature = 'hidden-thought-signature';
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(frame({
+      candidates: [{
+        index: 0,
+        content: {
+          parts: [
+            { thought: true, text: 'private reasoning', thoughtSignature: signature },
+            { text: 'visible answer' },
+          ],
+        },
+        safetyRatings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', probability: 'NEGLIGIBLE' }],
+        finishReason: 'MAX_TOKENS',
+      }],
+      usageMetadata: {
+        promptTokenCount: 3,
+        candidatesTokenCount: 5,
+        totalTokenCount: 10,
+        cachedContentTokenCount: 1,
+        thoughtsTokenCount: 2,
+        toolUsePromptTokenCount: 4,
+      },
+    }));
+    res.end();
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-sdc-gemini-picker',
+        stream: true,
+        messages: [{ role: 'user', content: 'Think.' }],
+      }),
+    });
+    const stream = await response.text();
+    const assembled = assembleAdapterEvents(events.filter(isAdapterEvent));
+
+    assert.equal(response.status, 200);
+    assert.equal(assembled.text, 'visible answer');
+    assert.equal(assembled.reasoning, 'private reasoning');
+    assert.deepEqual(assembled.usage, [{
+      inputTokens: 3,
+      outputTokens: 5,
+      totalTokens: 10,
+      cachedInputTokens: 1,
+      reasoningTokens: 2,
+      toolUsePromptTokens: 4,
+    }]);
+    assert.deepEqual(assembled.finishes, ['length']);
+    assert.deepEqual(assembled.metadata.gemini, [
+      {
+        candidate: {
+          index: 0,
+          safetyRatings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', probability: 'NEGLIGIBLE' }],
+        },
+      },
+      { thought: { candidateIndex: 0, partIndex: 0, signature } },
+      { candidate: { index: 0, finishReason: 'MAX_TOKENS' } },
+    ]);
+    assert.match(stream, /visible answer/);
+    assert.doesNotMatch(stream, /private reasoning|hidden-thought-signature/);
+    assert.match(stream, /"finish_reason":"length"/);
+    assert.equal(doneCount(stream), 1);
+  } finally {
+    await router.shutdown();
+    provider.closeAllConnections();
+    await close(provider);
+  }
+});
+
+test('Gemini adapter turns prompt-feedback-only and safety-blocked responses into typed outcomes', async (t) => {
+  for (const [name, response] of [
+    ['prompt feedback', {
+      promptFeedback: {
+        blockReason: 'SAFETY',
+        safetyRatings: [{ category: 'HARM_CATEGORY_DANGEROUS_CONTENT', probability: 'HIGH' }],
+      },
+    }],
+    ['candidate safety', {
+      candidates: [{
+        index: 0,
+        content: { parts: [] },
+        safetyRatings: [{ category: 'HARM_CATEGORY_DANGEROUS_CONTENT', probability: 'HIGH' }],
+        finishReason: 'SAFETY',
+      }],
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const provider = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(frame(response));
+      });
+      await listen(provider);
+      const events = [];
+      const router = makeRouter(provider, events);
+      await listen(router);
+      try {
+        const result = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'byok-sdc-gemini-picker',
+            stream: true,
+            messages: [{ role: 'user', content: 'Blocked.' }],
+          }),
+        });
+        const stream = await result.text();
+        const errors = events.filter(({ type }) => type === 'error');
+        assert.equal(result.status, 200);
+        assert.equal(errors.length, 1);
+        assert.equal(errors[0].error.category, 'upstream');
+        assert.match(stream, /"error"/);
+        assert.doesNotMatch(stream, /"finish_reason":"stop"/);
+        assert.equal(doneCount(stream), 1);
+      } finally {
+        await router.shutdown();
+        provider.closeAllConnections();
+        await close(provider);
+      }
+    });
+  }
+});
+
 function makeRouter(provider, events) {
   return createRouter({
     catalog: buildCatalog([{
@@ -419,7 +550,16 @@ function clientToolCalls(stream) {
 }
 
 function isAdapterEvent(event) {
-  return ['text', 'tool-fragment', 'tool', 'finish', 'error'].includes(event.type);
+  return [
+    'text',
+    'reasoning',
+    'tool-fragment',
+    'tool',
+    'usage',
+    'finish',
+    'metadata',
+    'error',
+  ].includes(event.type);
 }
 
 function listen(server) {
