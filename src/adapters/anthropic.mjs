@@ -3,6 +3,7 @@ import https from 'node:https';
 import { isDeepStrictEqual } from 'node:util';
 
 import { AdapterEventError } from './events.mjs';
+import { createStreamingLifecycle } from './lifecycle.mjs';
 
 const ANTHROPIC_VERSION = '2023-06-01';
 const JSON_SCHEMA_KEYWORDS = new Set([
@@ -51,7 +52,7 @@ function forwardAnthropic({ req, res, payload, route, onEvent, providerIdleTimeo
     respondJson(res, 400, { error: safe.toEvent().error });
     return;
   }
-  const lifecycle = createLifecycle({ res, onEvent, provider: provider.id, signal });
+  const lifecycle = createStreamingLifecycle({ res, onEvent, provider: provider.id, signal });
   const body = Buffer.from(JSON.stringify(outbound), 'utf8');
   const headers = {
     accept: 'text/event-stream',
@@ -119,68 +120,6 @@ function forwardAnthropic({ req, res, payload, route, onEvent, providerIdleTimeo
     else lifecycle.fail(safe);
   });
   providerReq.end(body);
-}
-
-function createLifecycle({ res, onEvent, provider, signal }) {
-  let terminal = false;
-  let request;
-  let source;
-  const removeListeners = () => {
-    signal?.removeEventListener('abort', cancel);
-    res.removeListener('close', onClose);
-  };
-  const release = () => {
-    removeListeners();
-    if (source && !source.destroyed) source.destroy();
-    if (request && !request.destroyed) request.destroy();
-  };
-  const cancel = () => {
-    if (terminal) return;
-    terminal = true;
-    release();
-  };
-  const fail = (error) => {
-    if (terminal || signal?.aborted || res.destroyed) return;
-    terminal = true;
-    const payload = error.toEvent().error;
-    onEvent({ type: 'error', provider, error: payload });
-    if (res.headersSent) {
-      if (!res.writableEnded && !res.destroyed) {
-        res.write(`data: ${JSON.stringify({ error: payload })}\n\n`);
-        res.end('data: [DONE]\n\n');
-      }
-    } else {
-      respondJson(res, error.status || 502, { error: payload });
-    }
-    release();
-  };
-  const complete = () => {
-    if (terminal) return;
-    terminal = true;
-    removeListeners();
-    if (!res.writableEnded && !res.destroyed) res.end('data: [DONE]\n\n');
-    if (source && !source.destroyed) source.destroy();
-  };
-  const onClose = () => {
-    if (!res.writableEnded) cancel();
-  };
-  signal?.addEventListener('abort', cancel, { once: true });
-  if (signal?.aborted) cancel();
-  res.once('close', onClose);
-  return {
-    get terminal() { return terminal; },
-    setRequest(value) {
-      request = value;
-      if (terminal && !request.destroyed) request.destroy();
-    },
-    setSource(value) {
-      source = value;
-      if (terminal && !source.destroyed) source.destroy();
-    },
-    cancel,
-    fail,
-    complete,
-  };
 }
 
 function anthropicHttpError(status = 502) {
