@@ -94,6 +94,7 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
       relayResponsesStream(providerRes, res, route.wireModel, {
         onEvent,
         provider: provider.id,
+        signal,
       });
     } else {
       res.writeHead(providerRes.statusCode, providerRes.headers);
@@ -130,11 +131,12 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
   providerReq.end(body);
 }
 
-function relayResponsesStream(source, res, model, { onEvent, provider }) {
+function relayResponsesStream(source, res, model, { onEvent, provider, signal }) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   let buffer = '';
   let finished = false;
   const emittedText = new Map();
+  const emittedRefusal = new Map();
   const toolCalls = new Map();
   const toolAliases = new Map();
   const writeChunk = (id, delta, finishReason = null) => {
@@ -148,9 +150,18 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
   const releaseSource = () => {
     if (!source.destroyed) source.destroy();
   };
+  const removeAbortListener = () => signal?.removeEventListener('abort', cancel);
+  const cancel = () => {
+    if (finished) return;
+    finished = true;
+    releaseSource();
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   const fail = (message, options = {}) => {
     if (finished) return;
     finished = true;
+    removeAbortListener();
     const error = new AdapterEventError(message, {
       category: 'malformed-response',
       retryable: false,
@@ -182,6 +193,7 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
       return;
     }
     finished = true;
+    removeAbortListener();
     writeChunk(id, {}, toolCalls.size ? 'tool_calls' : 'stop');
     res.end('data: [DONE]\n\n');
     releaseSource();
@@ -249,6 +261,7 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
   };
   source.setEncoding('utf8');
   source.on('data', (chunk) => {
+    if (signal?.aborted || finished) return;
     buffer += chunk;
     const frames = buffer.split(/\r?\n\r?\n/);
     buffer = frames.pop();
@@ -281,6 +294,21 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
           if (suffix) {
             emittedText.set(key, `${previous}${suffix}`);
             writeChunk(id, { content: suffix });
+          }
+        } else if (event.type === 'response.refusal.delta') {
+          const refusal = typeof event.delta === 'string' ? event.delta : '';
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          emittedRefusal.set(key, `${emittedRefusal.get(key) || ''}${refusal}`);
+          writeChunk(id, { refusal });
+        } else if (event.type === 'response.refusal.done') {
+          const refusal = typeof event.refusal === 'string' ? event.refusal
+            : typeof event.text === 'string' ? event.text : '';
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          const previous = emittedRefusal.get(key) || '';
+          const suffix = refusal.startsWith(previous) ? refusal.slice(previous.length) : refusal;
+          if (suffix) {
+            emittedRefusal.set(key, `${previous}${suffix}`);
+            writeChunk(id, { refusal: suffix });
           }
         } else if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
           addTool(event);
@@ -326,12 +354,20 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
     }
   });
   source.on('error', () => {
+    if (signal?.aborted || res.destroyed) {
+      cancel();
+      return;
+    }
     fail(
       'The provider response stream was interrupted.',
       { category: 'truncated', retryable: true },
     );
   });
   source.on('aborted', () => {
+    if (signal?.aborted || res.destroyed) {
+      cancel();
+      return;
+    }
     fail(
       'The provider response stream was aborted by the remote end.',
       { category: 'truncated', retryable: true },

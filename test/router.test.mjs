@@ -957,6 +957,98 @@ test('Responses transport interruptions emit one typed downstream failure', asyn
   }
 });
 
+test('Responses cancellation emits no post-cancel failure', async () => {
+  let providerStarted;
+  const providerReady = new Promise((resolve) => { providerStarted = resolve; });
+  const provider = http.createServer((req, res) => {
+    providerStarted();
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"response.output_text.delta","response":{"id":"resp-cancel"},"delta":"partial"}\n\n');
+    req.on('aborted', () => res.destroy());
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const events = [];
+  const catalog = buildCatalog([{
+    id: 'responses-cancel', name: 'Responses cancel',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-cancel', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    onEvent: (event) => events.push(event),
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  const request = http.request({
+    hostname: '127.0.0.1',
+    port: router.address().port,
+    path: '/chat/completions',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+  });
+  request.end(JSON.stringify({
+    model: 'byok-responses-cancel-gpt-6-cancel',
+    stream: true,
+    messages: [],
+  }));
+  try {
+    await providerReady;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    request.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(events.filter((event) => event.type === 'error').length, 0);
+  } finally {
+    await router.shutdown();
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses refusal streams preserve refusal deltas without duplicate completion text', async () => {
+  const frames = [
+    'data: {"type":"response.refusal.delta","response":{"id":"resp-refusal"},"output_index":0,"content_index":0,"delta":"Cannot"}\n\n',
+    'data: {"type":"response.refusal.done","response":{"id":"resp-refusal"},"output_index":0,"content_index":0,"refusal":"Cannot comply"}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp-refusal"}}\n\n',
+  ];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of frames) res.write(frame);
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-refusal', name: 'Responses refusal',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-refusal', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-refusal-gpt-6-refusal',
+        stream: true,
+        messages: [],
+      }),
+    });
+    const text = await response.text();
+    const refusals = text.split('\n\n').filter((frame) => frame.startsWith('data: {'))
+      .map((frame) => JSON.parse(frame.slice(6)))
+      .map((chunk) => chunk.choices?.[0]?.delta.refusal)
+      .filter((value) => value !== undefined);
+    assert.deepEqual(refusals, ['Cannot', ' comply']);
+    assert.match(text, /finish_reason":"stop"/);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses streams terminate with a Chat completion and close downstream', async () => {
   const frames = [
     'data: {"type":"response.output_text.delta","response":{"id":"resp-1"},"delta":"Today"}\n\n',
