@@ -28,6 +28,7 @@ function forwardAnthropic({ res, payload, route, onEvent, providerIdleTimeoutMs,
     respondJson(res, 400, { error: safe.toEvent().error });
     return;
   }
+  const lifecycle = createLifecycle({ res, onEvent, provider: provider.id, signal });
   const body = Buffer.from(JSON.stringify(outbound), 'utf8');
   const headers = {
     accept: 'text/event-stream',
@@ -49,39 +50,119 @@ function forwardAnthropic({ res, payload, route, onEvent, providerIdleTimeoutMs,
     method: 'POST',
     headers,
   }, (providerRes) => {
-    if (signal?.aborted || res.destroyed) {
+    lifecycle.setSource(providerRes);
+    if (lifecycle.terminal || signal?.aborted || res.destroyed) {
       providerRes.resume();
       return;
     }
     if ((providerRes.statusCode || 500) >= 300) {
-      res.writeHead(providerRes.statusCode, providerRes.headers);
-      providerRes.pipe(res);
+      const safe = anthropicHttpError(providerRes.statusCode);
+      providerRes.resume();
+      lifecycle.fail(safe);
       return;
     }
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-    translateSse(providerRes, res, (event) => onEvent({ ...event, provider: provider.id }));
+    translateSse(providerRes, res, (event) => onEvent({ ...event, provider: provider.id }), lifecycle);
   });
+  lifecycle.setRequest(providerReq);
 
   let timedOut = false;
   providerReq.setTimeout(providerIdleTimeoutMs, () => {
+    if (lifecycle.terminal) return;
     timedOut = true;
     providerReq.destroy(new Error('provider idle timeout'));
   });
   providerReq.on('error', (error) => {
-    if (signal?.aborted || res.destroyed) return;
+    if (lifecycle.terminal || signal?.aborted || res.destroyed) return;
     const category = timedOut ? 'timeout' : error.code === 'ABORT_ERR' ? 'cancelled' : 'upstream';
     const safe = new AdapterEventError(
       timedOut ? `Provider produced no data for ${Math.round(providerIdleTimeoutMs / 1000)} seconds.`
         : category === 'cancelled' ? 'Request cancelled.' : `${provider.name} is unreachable.`,
       { category, retryable: category === 'timeout' || category === 'upstream', cause: error },
     );
-    onEvent({ type: 'error', provider: provider.id, error: safe.toEvent().error });
-    respondJson(res, safe.status || 502, { error: safe.toEvent().error });
-  });
-  res.on('close', () => {
-    if (!res.writableEnded) providerReq.destroy();
+    if (category === 'cancelled') lifecycle.cancel();
+    else lifecycle.fail(safe);
   });
   providerReq.end(body);
+}
+
+function createLifecycle({ res, onEvent, provider, signal }) {
+  let terminal = false;
+  let request;
+  let source;
+  const removeListeners = () => {
+    signal?.removeEventListener('abort', cancel);
+    res.removeListener('close', onClose);
+  };
+  const release = () => {
+    removeListeners();
+    if (source && !source.destroyed) source.destroy();
+    if (request && !request.destroyed) request.destroy();
+  };
+  const cancel = () => {
+    if (terminal) return;
+    terminal = true;
+    release();
+  };
+  const fail = (error) => {
+    if (terminal || signal?.aborted || res.destroyed) return;
+    terminal = true;
+    const payload = error.toEvent().error;
+    onEvent({ type: 'error', provider, error: payload });
+    if (res.headersSent) {
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(`data: ${JSON.stringify({ error: payload })}\n\n`);
+        res.end('data: [DONE]\n\n');
+      }
+    } else {
+      respondJson(res, error.status || 502, { error: payload });
+    }
+    release();
+  };
+  const complete = () => {
+    if (terminal) return;
+    terminal = true;
+    removeListeners();
+    if (!res.writableEnded && !res.destroyed) res.end('data: [DONE]\n\n');
+    if (source && !source.destroyed) source.destroy();
+  };
+  const onClose = () => {
+    if (!res.writableEnded) cancel();
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
+  res.once('close', onClose);
+  return {
+    get terminal() { return terminal; },
+    setRequest(value) {
+      request = value;
+      if (terminal && !request.destroyed) request.destroy();
+    },
+    setSource(value) {
+      source = value;
+      if (terminal && !source.destroyed) source.destroy();
+    },
+    cancel,
+    fail,
+    complete,
+  };
+}
+
+function anthropicHttpError(status = 502) {
+  const definitions = {
+    400: ['invalid-request', false, 'The Anthropic provider rejected the request.'],
+    401: ['authentication', false, 'The Anthropic provider rejected its credentials.'],
+    403: ['authorization', false, 'The Anthropic provider denied access.'],
+    404: ['not-found', false, 'The Anthropic provider endpoint was not found.'],
+    408: ['timeout', true, 'The Anthropic provider timed out.'],
+    409: ['upstream', true, 'The Anthropic provider could not complete the request.'],
+    429: ['rate-limit', true, 'The Anthropic provider rate limit was exceeded.'],
+  };
+  const [category, retryable, message] = definitions[status]
+    || (status >= 500
+      ? ['upstream', true, 'The Anthropic provider failed to complete the request.']
+      : ['upstream', false, 'The Anthropic provider rejected the request.']);
+  return new AdapterEventError(message, { category, status, retryable });
 }
 
 function toAnthropicRequest(payload, route) {
@@ -650,50 +731,78 @@ function invalidAnthropicRequest(message) {
   });
 }
 
-function translateSse(source, res, onEvent) {
+function translateSse(source, res, onEvent, lifecycle) {
   let buffer = '';
-  let finished = false;
   const state = {
     blocks: new Map(),
     tools: new Map(),
     usage: {},
   };
-  const finish = (reason) => {
-    if (finished) return;
-    finished = true;
-    if (reason && !res.destroyed) {
-      const error = new AdapterEventError(reason, { category: 'truncated', retryable: true });
-      onEvent({ type: 'error', error: error.toEvent().error });
-    }
-    if (!res.writableEnded && !res.destroyed) res.end();
-  };
+  const fail = (message, options) => lifecycle.fail(new AdapterEventError(message, options));
   source.setEncoding('utf8');
   source.on('data', (chunk) => {
+    if (lifecycle.terminal) return;
     buffer += chunk;
-    let boundary;
-    while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-      const frame = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      handleFrame(frame, res, onEvent, state, () => { finished = true; });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop();
+    for (const frame of frames) {
+      if (lifecycle.terminal) break;
+      try {
+        handleFrame(frame, res, onEvent, state, lifecycle);
+      } catch (error) {
+        fail(error.message, { category: 'malformed-response', retryable: false });
+      }
     }
   });
-  source.on('end', () => finish(finished ? undefined : 'stream ended before message_stop'));
-  source.on('error', (error) => finish(`stream interrupted: ${error.message}`));
-  source.on('aborted', () => finish('stream aborted by the remote end'));
+  source.on('end', () => {
+    if (lifecycle.terminal) return;
+    fail(
+      buffer.trim()
+        ? 'The Anthropic provider stream ended with an incomplete frame.'
+        : 'The Anthropic provider stream ended before message_stop.',
+      { category: 'truncated', retryable: true },
+    );
+  });
+  source.on('error', () => {
+    if (lifecycle.terminal) return;
+    fail('The Anthropic provider response stream was interrupted.', {
+      category: 'truncated',
+      retryable: true,
+    });
+  });
+  source.on('aborted', () => {
+    if (lifecycle.terminal) return;
+    fail('The Anthropic provider response stream was aborted by the remote end.', {
+      category: 'truncated',
+      retryable: true,
+    });
+  });
 }
 
-function handleFrame(frame, res, onEvent, state, markFinished) {
-  const event = frame.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
-  const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
-  if (!data) return;
+function handleFrame(frame, res, onEvent, state, lifecycle) {
+  const lines = frame.split(/\r?\n/);
+  const eventLines = lines.filter((line) => line.startsWith('event:'));
+  const dataLines = lines.filter((line) => line.startsWith('data:'));
+  if (eventLines.length !== 1 || !dataLines.length) {
+    throw new Error('The Anthropic provider stream contained a malformed SSE frame.');
+  }
+  const event = eventLines[0].slice(6).trim();
+  const data = dataLines.map((line) => line.slice(5).trimStart()).join('\n').trim();
+  if (!event || !data) throw new Error('The Anthropic provider stream contained an incomplete SSE frame.');
   let value;
   try {
     value = JSON.parse(data);
   } catch {
-    return;
+    throw new Error('The Anthropic provider stream contained invalid JSON.');
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.type !== event) {
+    throw new Error('The Anthropic provider stream contained an invalid event shape.');
   }
   if (event === 'message_start') {
     const { id, model, usage } = value.message || {};
+    if (!value.message || typeof value.message !== 'object') {
+      throw new Error('Anthropic message_start requires a message.');
+    }
     onEvent({
       type: 'metadata',
       namespace: 'anthropic',
@@ -703,7 +812,9 @@ function handleFrame(frame, res, onEvent, state, markFinished) {
     writeChunk(res, id, model, { role: 'assistant' });
   } else if (event === 'content_block_start') {
     const block = value.content_block;
-    if (!block?.type || !Number.isInteger(value.index) || value.index < 0) return;
+    if (!block?.type || !Number.isInteger(value.index) || value.index < 0) {
+      throw new Error('Anthropic content_block_start requires a valid block and index.');
+    }
     state.blocks.set(value.index, block.type);
     const data = {
       contentBlock: { index: value.index, type: block.type },
@@ -711,6 +822,9 @@ function handleFrame(frame, res, onEvent, state, markFinished) {
     };
     onEvent({ type: 'metadata', namespace: 'anthropic', data });
     if (block.type !== 'tool_use') return;
+    if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name) {
+      throw new Error('Anthropic tool blocks require an ID and function name.');
+    }
     const tool = {
       id: block.id,
       index: value.index,
@@ -728,11 +842,14 @@ function handleFrame(frame, res, onEvent, state, markFinished) {
       }],
     });
   } else if (event === 'content_block_delta' && value.delta?.type === 'text_delta') {
+    if (typeof value.delta.text !== 'string') throw new Error('Anthropic text deltas require text.');
     onEvent({ type: 'text', text: value.delta.text });
     writeChunk(res, undefined, undefined, { content: value.delta.text });
   } else if (event === 'content_block_delta' && value.delta?.type === 'thinking_delta') {
+    if (typeof value.delta.thinking !== 'string') throw new Error('Anthropic thinking deltas require text.');
     onEvent({ type: 'reasoning', text: value.delta.thinking });
   } else if (event === 'content_block_delta' && value.delta?.type === 'signature_delta') {
+    if (typeof value.delta.signature !== 'string') throw new Error('Anthropic signature deltas require a signature.');
     onEvent({
       type: 'metadata',
       namespace: 'anthropic',
@@ -746,7 +863,9 @@ function handleFrame(frame, res, onEvent, state, markFinished) {
     });
   } else if (event === 'content_block_delta' && value.delta?.type === 'input_json_delta') {
     const tool = state.tools.get(value.index);
-    if (!tool) return;
+    if (!tool || typeof value.delta.partial_json !== 'string') {
+      throw new Error('Anthropic tool deltas require a known tool and JSON fragment.');
+    }
     tool.arguments += value.delta.partial_json;
     onEvent({
       type: 'tool-fragment',
@@ -762,10 +881,21 @@ function handleFrame(frame, res, onEvent, state, markFinished) {
     });
   } else if (event === 'content_block_stop') {
     const tool = state.tools.get(value.index);
+    if (!Number.isInteger(value.index) || value.index < 0) {
+      throw new Error('Anthropic content_block_stop requires a valid index.');
+    }
     if (!tool) return;
+    try {
+      JSON.parse(tool.arguments || '{}');
+    } catch {
+      throw new Error(`Anthropic tool call "${tool.id}" produced malformed arguments.`);
+    }
     onEvent({ type: 'tool', ...tool });
     state.tools.delete(value.index);
   } else if (event === 'message_delta') {
+    if (!value.delta || typeof value.delta !== 'object') {
+      throw new Error('Anthropic message_delta requires a delta.');
+    }
     const stopReason = value.delta?.stop_reason;
     emitAnthropicUsage(onEvent, state.usage, value.usage);
     if (stopReason) {
@@ -777,13 +907,33 @@ function handleFrame(frame, res, onEvent, state, markFinished) {
     }
     writeChunk(res, undefined, undefined, {}, mapStopReason(stopReason));
   } else if (event === 'error') {
-    const error = new AdapterEventError(value.error?.message || 'Anthropic provider error.', { category: 'upstream', retryable: false });
-    onEvent({ type: 'error', error: error.toEvent().error });
+    lifecycle.fail(anthropicStreamError(value.error));
   } else if (event === 'message_stop') {
-    res.write('data: [DONE]\n\n');
-    markFinished();
-    res.end();
+    lifecycle.complete();
+  } else if (event !== 'ping' && event !== 'content_block_delta') {
+    throw new Error(`The Anthropic provider stream contained unsupported event "${event}".`);
+  } else if (event === 'content_block_delta') {
+    throw new Error('The Anthropic provider stream contained an unsupported content delta.');
   }
+}
+
+function anthropicStreamError(nativeError) {
+  const type = nativeError?.type;
+  const definitions = {
+    authentication_error: ['authentication', false],
+    permission_error: ['authorization', false],
+    rate_limit_error: ['rate-limit', true],
+    request_too_large: ['invalid-request', false],
+    invalid_request_error: ['invalid-request', false],
+    not_found_error: ['not-found', false],
+    overloaded_error: ['upstream', true],
+    api_error: ['upstream', true],
+  };
+  const [category, retryable] = definitions[type] || ['upstream', false];
+  return new AdapterEventError('The Anthropic provider stream failed.', {
+    category,
+    retryable,
+  });
 }
 
 function emitAnthropicUsage(onEvent, accumulated, nativeUsage) {

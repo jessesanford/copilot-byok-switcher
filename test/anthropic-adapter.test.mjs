@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { buildCatalog } from '../src/catalog.mjs';
 import { loadConfig } from '../src/config.mjs';
+import { createAnthropicAdapter } from '../src/adapters/anthropic.mjs';
 import { assembleAdapterEvents } from '../src/adapters/events.mjs';
 import { createRouter } from '../src/router.mjs';
 import { createUpstreamResolver } from '../src/upstream.mjs';
@@ -63,6 +64,182 @@ test('Anthropic adapter maps text requests and SSE deltas to Copilot-compatible 
     assert.match(stream, /data: \[DONE\]/);
     assert.deepEqual(events.filter((event) => event.type === 'text').map((event) => event.text), ['Hello ', 'world']);
   } finally { await close(router); await close(provider); }
+});
+
+test('Anthropic adapter maps native HTTP failures to safe typed responses', async () => {
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'secret provider detail anthropic-key' } }));
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-anthropic-claude-test',
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 401);
+    assert.deepEqual(JSON.parse(body), {
+      error: {
+        category: 'authentication',
+        message: 'The Anthropic provider rejected its credentials.',
+        retryable: false,
+        status: 401,
+      },
+    });
+    assert.doesNotMatch(body, /secret provider detail|anthropic-key/);
+    assert.equal(events.filter((event) => event.type === 'error').length, 1);
+  } finally {
+    await close(router);
+    await close(provider);
+  }
+});
+
+test('Anthropic adapter preserves partial output then terminates once on native SSE errors', async () => {
+  const { stream, events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start', message: { id: 'msg_error', model: 'claude-test' },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' },
+    }),
+    anthropicFrame('error', {
+      type: 'error',
+      error: { type: 'overloaded_error', message: 'do not expose provider internals' },
+    }),
+    anthropicFrame('message_delta', {
+      type: 'message_delta', delta: { stop_reason: 'end_turn' },
+    }),
+    anthropicFrame('message_stop', { type: 'message_stop' }),
+  ]);
+  const payloads = parseSsePayloads(stream);
+  const error = payloads.find((payload) => payload.error)?.error;
+
+  assert.match(stream, /"content":"partial"/);
+  assert.deepEqual(error, {
+    category: 'upstream',
+    message: 'The Anthropic provider stream failed.',
+    retryable: true,
+  });
+  assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+  assert.equal(events.filter((event) => event.type === 'error').length, 1);
+  assert.equal(events.filter((event) => event.type === 'finish').length, 0);
+  assert.doesNotMatch(stream, /provider internals/);
+});
+
+test('Anthropic adapter accepts CRLF multiline data frames', async () => {
+  const frame = [
+    'event: message_start',
+    'data: {"type":"message_start",',
+    'data: "message":{"id":"msg_crlf","model":"claude-test"}}',
+    '',
+    '',
+  ].join('\r\n');
+  const { stream, events } = await relayAnthropicFrames([
+    frame,
+    anthropicFrame('message_stop', { type: 'message_stop' }).replaceAll('\n', '\r\n'),
+  ]);
+
+  assert.match(stream, /"role":"assistant"/);
+  assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+  assert.equal(events.filter((event) => event.type === 'error').length, 0);
+});
+
+test('Anthropic adapter fails closed on a trailing partial SSE frame', async () => {
+  const { stream, events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start', message: { id: 'msg_partial', model: 'claude-test' },
+    }),
+    'event: content_block_delta\ndata: {"type":"content_block_delta"',
+  ]);
+  const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+
+  assert.equal(error.category, 'truncated');
+  assert.equal(error.retryable, true);
+  assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+  assert.equal(events.filter((event) => event.type === 'error').length, 1);
+});
+
+test('Anthropic adapter turns a stalled partial stream into one timeout and aborts upstream', async () => {
+  let aborts = 0;
+  const provider = http.createServer((req, res) => {
+    req.once('aborted', () => { aborts += 1; });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(anthropicFrame('message_start', {
+      type: 'message_start', message: { id: 'msg_timeout', model: 'claude-test' },
+    }));
+    res.write(anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' },
+    }));
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events, {}, {
+    resolve: () => createAnthropicAdapter({ providerIdleTimeoutMs: 40 }),
+  });
+  await listen(router);
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-anthropic-claude-test',
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const stream = await response.text();
+    assert.match(stream, /"content":"partial"/);
+    assert.equal(parseSsePayloads(stream).find((payload) => payload.error)?.error.category, 'timeout');
+    assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+    assert.equal(events.filter((event) => event.type === 'error').length, 1);
+    await delay(30);
+    assert.equal(aborts, 1);
+  } finally {
+    await close(router);
+    await close(provider);
+  }
+});
+
+test('Anthropic adapter cancels before provider headers without a terminal diagnostic', async () => {
+  let aborts = 0;
+  let started;
+  const providerStarted = new Promise((resolve) => { started = resolve; });
+  const provider = http.createServer((req) => {
+    started();
+    req.once('aborted', () => { aborts += 1; });
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+  const controller = new AbortController();
+  const pending = fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'byok-anthropic-claude-test',
+      messages: [{ role: 'user', content: 'go' }],
+    }),
+    signal: controller.signal,
+  });
+  try {
+    await providerStarted;
+    controller.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+    await delay(50);
+    assert.equal(aborts, 1);
+    assert.equal(events.filter((event) => event.type === 'error').length, 0);
+  } finally {
+    await close(router);
+    await close(provider);
+  }
 });
 
 test('Anthropic adapter assembles fragmented and interleaved native tool streams in provider order', async () => {
@@ -1073,6 +1250,13 @@ function parseChatChunks(stream) {
     .map((line) => JSON.parse(line.slice(6)));
 }
 
+function parseSsePayloads(stream) {
+  return stream
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data: {'))
+    .map((line) => JSON.parse(line.slice(6)));
+}
+
 async function relayAnthropicFrames(responseFrames) {
   const provider = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -1105,9 +1289,10 @@ async function relayAnthropicFrames(responseFrames) {
   }
 }
 
-function makeRouter(provider, events, model = {}) {
+function makeRouter(provider, events, model = {}, adapters) {
   return createRouter({
     catalog: buildCatalog([{ id: 'anthropic', name: 'Anthropic', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: 'anthropic-key', adapterKind: 'anthropic', models: [{ model: 'claude-test', ...model }] }]),
+    ...(adapters ? { adapters } : {}),
     onEvent: (event) => events.push(event),
     upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
   });
@@ -1115,3 +1300,4 @@ function makeRouter(provider, events, model = {}) {
 
 function listen(server) { return new Promise((resolve) => server.listen(0, '127.0.0.1', resolve)); }
 async function close(server) { await server.shutdown?.(); server.closeAllConnections?.(); if (server.listening) await new Promise((resolve) => server.close(resolve)); }
+function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
