@@ -481,6 +481,148 @@ test('Responses parallel tool streams emit each fragment once and one terminal c
   }
 });
 
+test('Responses tool indexes stay dense when reasoning output precedes function calls', async () => {
+  const frames = [
+    'data: {"type":"response.output_item.added","response":{"id":"resp-dense"},"output_index":0,"item":{"type":"reasoning","id":"reasoning_1"}}\n\n',
+    'data: {"type":"response.output_item.added","response":{"id":"resp-dense"},"output_index":1,"item":{"id":"item_a","type":"function_call","call_id":"call_a","name":"first","arguments":"{}"}}\n\n',
+    'data: {"type":"response.output_item.added","response":{"id":"resp-dense"},"output_index":3,"item":{"id":"item_b","type":"function_call","call_id":"call_b","name":"second","arguments":"{}"}}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp-dense"}}\n\n',
+  ];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of frames) res.write(frame);
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-dense', name: 'Responses dense indexes',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-dense', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-dense-gpt-6-dense', stream: true, messages: [] }),
+    });
+    const text = await response.text();
+    const chunks = text.split('\n\n').filter((frame) => frame.startsWith('data: {'))
+      .map((frame) => JSON.parse(frame.slice(6)));
+    const indexes = chunks.flatMap((chunk) => chunk.choices?.[0]?.delta.tool_calls || [])
+      .map((call) => call.index);
+    assert.deepEqual(indexes, [0, 1]);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses failure terminal events retain typed failure semantics', async () => {
+  for (const scenario of [
+    {
+      type: 'response.failed',
+      response: { id: 'resp-failed', error: { message: 'provider rejected the response' } },
+      category: 'upstream',
+      retryable: false,
+      message: /provider rejected/,
+    },
+    {
+      type: 'response.incomplete',
+      response: { id: 'resp-incomplete', incomplete_details: { reason: 'max_output_tokens' } },
+      category: 'truncated',
+      retryable: true,
+      message: /max_output_tokens/,
+    },
+    {
+      type: 'error',
+      error: { message: 'provider stream failed' },
+      category: 'upstream',
+      retryable: false,
+      message: /provider stream failed/,
+    },
+  ]) {
+    const events = [];
+    const provider = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify(scenario)}\n\n`);
+      res.end();
+    });
+    await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+    const catalog = buildCatalog([{
+      id: 'responses-failure', name: 'Responses failure',
+      baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+      apiKey: 'k', models: [{ model: 'gpt-6-failure', endpointFamily: 'responses' }],
+    }]);
+    const router = createRouter({
+      catalog,
+      onEvent: (event) => events.push(event),
+      upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+    });
+    await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+    try {
+      const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'byok-responses-failure-gpt-6-failure', stream: true, messages: [] }),
+      });
+      const text = await response.text();
+      const errorFrame = text.split('\n\n').find((frame) => frame.startsWith('data: {"error"'));
+      assert.ok(errorFrame, `${scenario.type} emits a downstream SSE error`);
+      const error = JSON.parse(errorFrame.slice(6)).error;
+      assert.equal(error.category, scenario.category);
+      assert.equal(error.retryable, scenario.retryable);
+      assert.match(error.message, scenario.message);
+      assert.doesNotMatch(text, /finish_reason/);
+      assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+      assert.equal(events.at(-1).error.category, scenario.category);
+    } finally {
+      router.closeAllConnections();
+      await new Promise((resolve) => router.close(resolve));
+      await new Promise((resolve) => provider.close(resolve));
+    }
+  }
+});
+
+test('malformed Responses tool streams emit a typed downstream error', async () => {
+  const events = [];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"response.function_call_arguments.delta","response":{"id":"resp-malformed"},"item_id":"missing","delta":"{}"}\n\n');
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-malformed', name: 'Responses malformed stream',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-malformed', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    onEvent: (event) => events.push(event),
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-malformed-gpt-6-malformed', stream: true, messages: [] }),
+    });
+    const text = await response.text();
+    const errorFrame = text.split('\n\n').find((frame) => frame.startsWith('data: {"error"'));
+    assert.ok(errorFrame);
+    const error = JSON.parse(errorFrame.slice(6)).error;
+    assert.equal(error.category, 'malformed-response');
+    assert.match(error.message, /known call ID/);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+    assert.equal(events.at(-1).error.category, 'malformed-response');
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses streams terminate with a Chat completion and close downstream', async () => {
   const frames = [
     'data: {"type":"response.output_text.delta","response":{"id":"resp-1"},"delta":"Today"}\n\n',
@@ -514,7 +656,10 @@ test('Responses streams terminate with a Chat completion and close downstream', 
 });
 
 test('Responses terminal events close downstream before the provider socket closes', async () => {
+  let upstreamClosed;
+  const upstreamClose = new Promise((resolve) => { upstreamClosed = resolve; });
   const provider = http.createServer((_req, res) => {
+    res.on('close', upstreamClosed);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"type":"response.output_text.delta","response":{"id":"resp-open"},"delta":"done"}\n\n');
     res.write('data: {"type":"response.completed","response":{"id":"resp-open"}}\n\n');
@@ -538,6 +683,10 @@ test('Responses terminal events close downstream before the provider socket clos
     ]);
     assert.match(text, /"content":"done"/);
     assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+    await Promise.race([
+      upstreamClose,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('adapter left upstream socket open')), 500)),
+    ]);
   } finally {
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));

@@ -142,15 +142,23 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
       choices: [{ index: 0, delta, finish_reason: finishReason }],
     })}\n\n`);
   };
-  const fail = (message) => {
+  const releaseSource = () => {
+    if (!source.destroyed) source.destroy();
+  };
+  const fail = (message, options = {}) => {
     if (finished) return;
     finished = true;
     const error = new AdapterEventError(message, {
       category: 'malformed-response',
       retryable: false,
+      ...options,
     });
     onEvent({ type: 'error', provider, error: error.toEvent().error });
-    if (!res.writableEnded && !res.destroyed) res.end();
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`data: ${JSON.stringify({ error: error.toEvent().error })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    }
+    releaseSource();
   };
   const validateToolCalls = () => {
     for (const [callId, call] of toolCalls) {
@@ -173,6 +181,7 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
     finished = true;
     writeChunk(id, {}, toolCalls.size ? 'tool_calls' : 'stop');
     res.end('data: [DONE]\n\n');
+    releaseSource();
   };
   const addTool = (event) => {
     const item = event.item;
@@ -189,7 +198,7 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
       return existing;
     }
     const call = {
-      index: Number.isInteger(event.output_index) ? event.output_index : toolCalls.size,
+      index: toolCalls.size,
       name: item.name,
       arguments: typeof item.arguments === 'string' ? item.arguments : '',
     };
@@ -273,6 +282,24 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
           appendToolArguments(event, true);
         } else if (event.type === 'response.completed' || event.type === 'response.done') {
           finish(id);
+        } else if (event.type === 'response.failed') {
+          fail(
+            event.response?.error?.message || 'The provider failed to complete the response.',
+            { category: 'upstream', retryable: false },
+          );
+        } else if (event.type === 'response.incomplete') {
+          const reason = event.response?.incomplete_details?.reason;
+          fail(
+            reason
+              ? `The provider returned an incomplete response: ${reason}.`
+              : 'The provider returned an incomplete response.',
+            { category: 'truncated', retryable: true },
+          );
+        } else if (event.type === 'error') {
+          fail(
+            event.error?.message || event.message || 'The provider stream failed.',
+            { category: 'upstream', retryable: Boolean(event.error?.retryable) },
+          );
         }
       } catch (error) {
         fail(error.message);
