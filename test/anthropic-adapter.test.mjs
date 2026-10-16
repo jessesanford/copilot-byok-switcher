@@ -412,6 +412,22 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
         { role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { arguments: '{}' } }] },
       ],
     }],
+    ['invalid tool call name', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'invalid name', arguments: '{}' } }],
+        },
+      ],
+    }],
+    ['invalid function definition name', {
+      tools: [{
+        type: 'function',
+        function: { name: 'x'.repeat(65), parameters: { type: 'object' } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
     ['missing function schema', {
       tools: [{ type: 'function', function: { name: 'go' } }],
       messages: [{ role: 'user', content: 'go' }],

@@ -295,6 +295,7 @@ function addToolUse(content, pendingCalls, usedCallIds, call) {
   if (typeof call.name !== 'string' || !call.name) {
     throw invalidAnthropicRequest(`Anthropic tool call "${call.id}" requires a function name.`);
   }
+  validateAnthropicToolName(call.name, `tool call "${call.id}"`);
   let input;
   if (typeof call.arguments !== 'string') {
     throw invalidAnthropicRequest(`Anthropic tool call "${call.id}" requires JSON arguments.`);
@@ -380,6 +381,7 @@ function canonicalTool(fn, names) {
   if (!fn || typeof fn !== 'object' || Array.isArray(fn) || typeof fn.name !== 'string' || !fn.name) {
     throw invalidAnthropicRequest('Anthropic function definitions require a name.');
   }
+  validateAnthropicToolName(fn.name, 'function definition');
   if (fn.description !== undefined && typeof fn.description !== 'string') {
     throw invalidAnthropicRequest(`Anthropic function definition "${fn.name}" description must be a string.`);
   }
@@ -583,6 +585,12 @@ function validateJsonSchemaPattern(pattern, location) {
     new RegExp(pattern);
   } catch {
     throw invalidAnthropicRequest(`Anthropic JSON Schema ${location} must be a valid regular expression.`);
+  }
+}
+
+function validateAnthropicToolName(name, location) {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+    throw invalidAnthropicRequest(`Anthropic ${location} name must match ^[a-zA-Z0-9_-]{1,64}$.`);
   }
 }
 
