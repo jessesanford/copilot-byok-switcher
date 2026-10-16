@@ -559,7 +559,7 @@ test('Anthropic adapter assembles fragmented and interleaved native tool streams
     anthropicFrame('message_stop', { type: 'message_stop' }),
   ];
   const { stream, events } = await relayAnthropicFrames(toolFrames);
-  const chunks = parseChatChunks(stream);
+  const chunks = parseSsePayloads(stream);
 
   assert.deepEqual(chunks.map((chunk) => chunk.choices[0]), [
     { index: 0, delta: { role: 'assistant' }, finish_reason: null },
@@ -639,7 +639,7 @@ test('Anthropic adapter preserves mixed text, empty tools, and message-stop term
   ];
   const { stream, events } = await relayAnthropicFrames(mixedFrames);
 
-  assert.deepEqual(parseChatChunks(stream).map((chunk) => chunk.choices[0].delta), [
+  assert.deepEqual(parseSsePayloads(stream).map((chunk) => chunk.choices[0].delta), [
     { role: 'assistant' },
     { content: 'before' },
     {
@@ -752,7 +752,7 @@ test('Anthropic adapter preserves thinking, signatures, redactions, identity, an
     { stopReason: 'pause_turn' },
   ]);
   assert.deepEqual(assembled.finishes, ['stop']);
-  assert.equal(parseChatChunks(stream)[0].model, 'claude-provider-model');
+  assert.equal(parseSsePayloads(stream)[0].model, 'claude-provider-model');
   assert.match(stream, /"content":"Visible answer"/);
   assert.doesNotMatch(stream, /First |then second|signature-bytes|encrypted-redacted-payload/);
 });
@@ -806,7 +806,7 @@ test('Anthropic adapter maps max-token and unknown terminal reasons predictably'
       anthropicFrame('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason } }),
       anthropicFrame('message_stop', { type: 'message_stop' }),
     ]);
-    assert.equal(parseChatChunks(stream).at(-1).choices[0].finish_reason, chatReason);
+    assert.equal(parseSsePayloads(stream).at(-1).choices[0].finish_reason, chatReason);
     const assembled = assembleAdapterEvents(events);
     assert.deepEqual(assembled.finishes, [normalizedReason]);
     assert.deepEqual(assembled.metadata.anthropic.at(-1), { stopReason });
@@ -1544,13 +1544,6 @@ async function sendAnthropicRequest(payload) {
 
 function anthropicFrame(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-function parseChatChunks(stream) {
-  return stream
-    .split('\n')
-    .filter((line) => line.startsWith('data: {'))
-    .map((line) => JSON.parse(line.slice(6)));
 }
 
 function parseSsePayloads(stream) {

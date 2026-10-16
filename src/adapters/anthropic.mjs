@@ -5,6 +5,29 @@ import { isDeepStrictEqual } from 'node:util';
 import { AdapterEventError } from './events.mjs';
 
 const ANTHROPIC_VERSION = '2023-06-01';
+const JSON_SCHEMA_KEYWORDS = new Set([
+  '$anchor', '$comment', '$defs', '$id', '$ref', '$schema',
+  'additionalItems', 'additionalProperties', 'allOf', 'anyOf',
+  'const', 'contains', 'contentEncoding', 'contentMediaType', 'default',
+  'definitions', 'dependencies', 'dependentRequired', 'dependentSchemas',
+  'deprecated', 'description', 'else', 'enum', 'examples',
+  'exclusiveMaximum', 'exclusiveMinimum', 'format', 'if', 'items',
+  'maxContains', 'maximum', 'maxItems', 'maxLength', 'maxProperties',
+  'minContains', 'minimum', 'minItems', 'minLength', 'minProperties',
+  'multipleOf', 'not', 'oneOf', 'pattern', 'patternProperties',
+  'prefixItems', 'properties', 'propertyNames', 'readOnly', 'required',
+  'then', 'title', 'type', 'unevaluatedItems', 'unevaluatedProperties',
+  'uniqueItems', 'writeOnly',
+  'private',
+]);
+const JSON_SCHEMA_TYPES = new Set([
+  'array', 'boolean', 'integer', 'null', 'number', 'object', 'string',
+]);
+const STOP_REASON_MAPPINGS = new Map([
+  ['max_tokens', Object.freeze({ chat: 'length', normalized: 'length' })],
+  ['tool_use', Object.freeze({ chat: 'tool_calls', normalized: 'tool-calls' })],
+]);
+const DEFAULT_STOP_REASON_MAPPING = Object.freeze({ chat: 'stop', normalized: 'stop' });
 
 export function createAnthropicAdapter({ providerIdleTimeoutMs }) {
   return Object.freeze({
@@ -486,22 +509,7 @@ function canonicalJsonSchema(schema) {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
     throw invalidAnthropicRequest('Anthropic JSON Schema entries must be objects or booleans.');
   }
-  const supportedKeywords = new Set([
-    '$anchor', '$comment', '$defs', '$id', '$ref', '$schema',
-    'additionalItems', 'additionalProperties', 'allOf', 'anyOf',
-    'const', 'contains', 'contentEncoding', 'contentMediaType', 'default',
-    'definitions', 'dependencies', 'dependentRequired', 'dependentSchemas',
-    'deprecated', 'description', 'else', 'enum', 'examples',
-    'exclusiveMaximum', 'exclusiveMinimum', 'format', 'if', 'items',
-    'maxContains', 'maximum', 'maxItems', 'maxLength', 'maxProperties',
-    'minContains', 'minimum', 'minItems', 'minLength', 'minProperties',
-    'multipleOf', 'not', 'oneOf', 'pattern', 'patternProperties',
-    'prefixItems', 'properties', 'propertyNames', 'readOnly', 'required',
-    'then', 'title', 'type', 'unevaluatedItems', 'unevaluatedProperties',
-    'uniqueItems', 'writeOnly',
-    'private',
-  ]);
-  const unknownKeyword = Object.keys(schema).find((key) => !supportedKeywords.has(key));
+  const unknownKeyword = Object.keys(schema).find((key) => !JSON_SCHEMA_KEYWORDS.has(key));
   if (unknownKeyword !== undefined) {
     throw invalidAnthropicRequest(`Anthropic JSON Schema keyword "${unknownKeyword}" is unsupported.`);
   }
@@ -519,12 +527,11 @@ function canonicalJsonSchema(schema) {
     }
   }
   if (schema.type !== undefined) {
-    const validTypes = new Set(['array', 'boolean', 'integer', 'null', 'number', 'object', 'string']);
-    if (typeof schema.type === 'string' && validTypes.has(schema.type)) {
+    if (typeof schema.type === 'string' && JSON_SCHEMA_TYPES.has(schema.type)) {
       result.type = schema.type;
     } else if (Array.isArray(schema.type)
       && schema.type.length
-      && schema.type.every((entry) => typeof entry === 'string' && validTypes.has(entry))
+      && schema.type.every((entry) => typeof entry === 'string' && JSON_SCHEMA_TYPES.has(entry))
       && new Set(schema.type).size === schema.type.length) {
       result.type = [...schema.type];
     } else {
@@ -786,6 +793,27 @@ function translateSse(source, res, onEvent, lifecycle) {
 }
 
 function handleFrame(frame, res, onEvent, state, lifecycle) {
+  const { event, value } = parseAnthropicFrame(frame);
+  if (event === 'message_start') {
+    handleMessageStart(value, res, onEvent, state);
+  } else if (event === 'content_block_start') {
+    handleContentBlockStart(value, res, onEvent, state);
+  } else if (event === 'content_block_delta') {
+    handleContentBlockDelta(value, res, onEvent, state);
+  } else if (event === 'content_block_stop') {
+    handleContentBlockStop(value, onEvent, state);
+  } else if (event === 'message_delta') {
+    handleMessageDelta(value, onEvent, state);
+  } else if (event === 'error') {
+    lifecycle.fail(anthropicStreamError(value.error));
+  } else if (event === 'message_stop') {
+    handleMessageStop(res, onEvent, state, lifecycle);
+  } else if (event !== 'ping') {
+    throw new Error('The Anthropic provider stream contained an unsupported event.');
+  }
+}
+
+function parseAnthropicFrame(frame) {
   const lines = frame.split(/\r?\n/);
   const eventLines = lines.filter((line) => line.startsWith('event:'));
   const dataLines = lines.filter((line) => line.startsWith('data:'));
@@ -804,181 +832,200 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.type !== event) {
     throw new Error('The Anthropic provider stream contained an invalid event shape.');
   }
-  if (event === 'message_start') {
-    if (state.messageStarted) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    const { id, model, usage } = value.message || {};
-    if (!value.message || typeof value.message !== 'object') {
-      throw new Error('Anthropic message_start requires a message.');
-    }
-    state.messageStarted = true;
-    onEvent({
-      type: 'metadata',
-      namespace: 'anthropic',
-      data: { message: { ...(id === undefined ? {} : { id }), ...(model === undefined ? {} : { model }) } },
-    });
-    emitAnthropicUsage(onEvent, state.usage, usage);
-    writeChunk(res, id, model, { role: 'assistant' });
-  } else if (event === 'content_block_start') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    const block = value.content_block;
-    if (!block?.type || !Number.isInteger(value.index) || value.index < 0) {
-      throw new Error('Anthropic content_block_start requires a valid block and index.');
-    }
-    if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)
-      || state.seenBlocks.has(value.index)) {
-      throw new Error('The Anthropic provider stream contained an invalid content block.');
-    }
-    state.seenBlocks.add(value.index);
-    state.blocks.set(value.index, block.type);
-    const data = {
-      contentBlock: { index: value.index, type: block.type },
-      ...(block.type === 'redacted_thinking' ? { redactedThinking: block.data } : {}),
-    };
-    onEvent({ type: 'metadata', namespace: 'anthropic', data });
-    if (block.type !== 'tool_use') return;
-    if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name) {
-      throw new Error('Anthropic tool blocks require an ID and function name.');
-    }
-    if (state.toolIds.has(block.id)) {
-      throw new Error('The Anthropic provider stream contained a duplicate tool ID.');
-    }
-    state.toolIds.add(block.id);
-    const tool = {
-      id: block.id,
-      index: value.index,
-      name: block.name,
-      arguments: '',
-    };
-    state.tools.set(value.index, tool);
-    onEvent({ type: 'tool-fragment', ...tool });
-    writeChunk(res, undefined, undefined, {
-      tool_calls: [{
-        index: tool.index,
-        id: tool.id,
-        type: 'function',
-        function: { name: tool.name, arguments: '' },
-      }],
-    });
-  } else if (event === 'content_block_delta' && value.delta?.type === 'text_delta') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    if (state.blocks.get(value.index) !== 'text' || typeof value.delta.text !== 'string') {
-      throw new Error('The Anthropic provider stream contained an invalid text delta.');
-    }
-    onEvent({ type: 'text', text: value.delta.text });
-    writeChunk(res, undefined, undefined, { content: value.delta.text });
-  } else if (event === 'content_block_delta' && value.delta?.type === 'thinking_delta') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.thinking !== 'string') {
-      throw new Error('The Anthropic provider stream contained an invalid thinking delta.');
-    }
-    onEvent({ type: 'reasoning', text: value.delta.thinking });
-  } else if (event === 'content_block_delta' && value.delta?.type === 'signature_delta') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.signature !== 'string') {
-      throw new Error('The Anthropic provider stream contained an invalid signature delta.');
-    }
-    onEvent({
-      type: 'metadata',
-      namespace: 'anthropic',
-      data: {
-        contentBlock: {
-          index: value.index,
-          type: 'thinking',
-        },
-        signature: value.delta.signature,
-      },
-    });
-  } else if (event === 'content_block_delta' && value.delta?.type === 'input_json_delta') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    const tool = state.tools.get(value.index);
-    if (state.blocks.get(value.index) !== 'tool_use'
-      || !tool
-      || typeof value.delta.partial_json !== 'string') {
-      throw new Error('The Anthropic provider stream contained an invalid tool delta.');
-    }
-    tool.arguments += value.delta.partial_json;
-    onEvent({
-      type: 'tool-fragment',
+  return { event, value };
+}
+
+function handleMessageStart(value, res, onEvent, state) {
+  if (state.messageStarted) {
+    throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+  }
+  const { id, model, usage } = value.message || {};
+  if (!value.message || typeof value.message !== 'object') {
+    throw new Error('Anthropic message_start requires a message.');
+  }
+  state.messageStarted = true;
+  onEvent({
+    type: 'metadata',
+    namespace: 'anthropic',
+    data: { message: { ...(id === undefined ? {} : { id }), ...(model === undefined ? {} : { model }) } },
+  });
+  emitAnthropicUsage(onEvent, state.usage, usage);
+  writeChunk(res, id, model, { role: 'assistant' });
+}
+
+function handleContentBlockStart(value, res, onEvent, state) {
+  requireContentPhase(state);
+  const block = value.content_block;
+  if (!block?.type || !Number.isInteger(value.index) || value.index < 0) {
+    throw new Error('Anthropic content_block_start requires a valid block and index.');
+  }
+  if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)
+    || state.seenBlocks.has(value.index)) {
+    throw new Error('The Anthropic provider stream contained an invalid content block.');
+  }
+  state.seenBlocks.add(value.index);
+  state.blocks.set(value.index, block.type);
+  const data = {
+    contentBlock: { index: value.index, type: block.type },
+    ...(block.type === 'redacted_thinking' ? { redactedThinking: block.data } : {}),
+  };
+  onEvent({ type: 'metadata', namespace: 'anthropic', data });
+  if (block.type !== 'tool_use') return;
+  if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name) {
+    throw new Error('Anthropic tool blocks require an ID and function name.');
+  }
+  if (state.toolIds.has(block.id)) {
+    throw new Error('The Anthropic provider stream contained a duplicate tool ID.');
+  }
+  state.toolIds.add(block.id);
+  const tool = {
+    id: block.id,
+    index: value.index,
+    name: block.name,
+    arguments: '',
+  };
+  state.tools.set(value.index, tool);
+  onEvent({ type: 'tool-fragment', ...tool });
+  writeChunk(res, undefined, undefined, {
+    tool_calls: [{
       index: tool.index,
       id: tool.id,
-      arguments: value.delta.partial_json,
-    });
-    writeChunk(res, undefined, undefined, {
-      tool_calls: [{
-        index: tool.index,
-        function: { arguments: value.delta.partial_json },
-      }],
-    });
-  } else if (event === 'content_block_stop') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    const tool = state.tools.get(value.index);
-    if (!Number.isInteger(value.index) || value.index < 0 || !state.blocks.has(value.index)) {
-      throw new Error('The Anthropic provider stream contained an invalid content block stop.');
-    }
-    if (tool) {
-      let argumentsValue;
-      try {
-        argumentsValue = JSON.parse(tool.arguments || '{}');
-      } catch {
-        throw new Error('The Anthropic provider stream contained malformed tool arguments.');
-      }
-      if (!argumentsValue || typeof argumentsValue !== 'object' || Array.isArray(argumentsValue)) {
-        throw new Error('The Anthropic provider stream contained invalid tool arguments.');
-      }
-      onEvent({ type: 'tool', ...tool });
-      state.tools.delete(value.index);
-    }
-    state.blocks.delete(value.index);
-  } else if (event === 'message_delta') {
-    if (!state.messageStarted || state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    if (!value.delta || typeof value.delta !== 'object') {
-      throw new Error('Anthropic message_delta requires a delta.');
-    }
-    state.messageDeltaSeen = true;
-    const stopReason = value.delta?.stop_reason;
-    if (typeof stopReason !== 'string' || !stopReason.trim()) {
-      throw new Error('The Anthropic provider stream contained an invalid terminal stop reason.');
-    }
-    emitAnthropicUsage(onEvent, state.usage, value.usage);
-    state.stopReason = stopReason;
-  } else if (event === 'error') {
-    lifecycle.fail(anthropicStreamError(value.error));
-  } else if (event === 'message_stop') {
-    if (!state.messageStarted || !state.messageDeltaSeen) {
-      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
-    }
-    if (state.blocks.size || state.tools.size) {
-      throw new Error('The Anthropic provider stream ended with incomplete content blocks.');
-    }
-    if (state.stopReason) {
-      onEvent({
-        type: 'finish',
-        reason: mapNormalizedStopReason(state.stopReason),
-        metadata: { anthropic: { stopReason: state.stopReason } },
-      });
-      writeChunk(res, undefined, undefined, {}, mapStopReason(state.stopReason));
-    }
-    lifecycle.complete();
-  } else if (event !== 'ping' && event !== 'content_block_delta') {
-    throw new Error('The Anthropic provider stream contained an unsupported event.');
-  } else if (event === 'content_block_delta') {
+      type: 'function',
+      function: { name: tool.name, arguments: '' },
+    }],
+  });
+}
+
+function handleContentBlockDelta(value, res, onEvent, state) {
+  if (value.delta?.type === 'text_delta') {
+    requireContentPhase(state);
+    handleTextDelta(value, res, onEvent, state);
+  } else if (value.delta?.type === 'thinking_delta') {
+    requireContentPhase(state);
+    handleThinkingDelta(value, onEvent, state);
+  } else if (value.delta?.type === 'signature_delta') {
+    requireContentPhase(state);
+    handleSignatureDelta(value, onEvent, state);
+  } else if (value.delta?.type === 'input_json_delta') {
+    requireContentPhase(state);
+    handleToolDelta(value, res, onEvent, state);
+  } else {
     throw new Error('The Anthropic provider stream contained an unsupported content delta.');
+  }
+}
+
+function handleTextDelta(value, res, onEvent, state) {
+  if (state.blocks.get(value.index) !== 'text' || typeof value.delta.text !== 'string') {
+    throw new Error('The Anthropic provider stream contained an invalid text delta.');
+  }
+  onEvent({ type: 'text', text: value.delta.text });
+  writeChunk(res, undefined, undefined, { content: value.delta.text });
+}
+
+function handleThinkingDelta(value, onEvent, state) {
+  if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.thinking !== 'string') {
+    throw new Error('The Anthropic provider stream contained an invalid thinking delta.');
+  }
+  onEvent({ type: 'reasoning', text: value.delta.thinking });
+}
+
+function handleSignatureDelta(value, onEvent, state) {
+  if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.signature !== 'string') {
+    throw new Error('The Anthropic provider stream contained an invalid signature delta.');
+  }
+  onEvent({
+    type: 'metadata',
+    namespace: 'anthropic',
+    data: {
+      contentBlock: {
+        index: value.index,
+        type: 'thinking',
+      },
+      signature: value.delta.signature,
+    },
+  });
+}
+
+function handleToolDelta(value, res, onEvent, state) {
+  const tool = state.tools.get(value.index);
+  if (state.blocks.get(value.index) !== 'tool_use'
+    || !tool
+    || typeof value.delta.partial_json !== 'string') {
+    throw new Error('The Anthropic provider stream contained an invalid tool delta.');
+  }
+  tool.arguments += value.delta.partial_json;
+  onEvent({
+    type: 'tool-fragment',
+    index: tool.index,
+    id: tool.id,
+    arguments: value.delta.partial_json,
+  });
+  writeChunk(res, undefined, undefined, {
+    tool_calls: [{
+      index: tool.index,
+      function: { arguments: value.delta.partial_json },
+    }],
+  });
+}
+
+function handleContentBlockStop(value, onEvent, state) {
+  requireContentPhase(state);
+  const tool = state.tools.get(value.index);
+  if (!Number.isInteger(value.index) || value.index < 0 || !state.blocks.has(value.index)) {
+    throw new Error('The Anthropic provider stream contained an invalid content block stop.');
+  }
+  if (tool) {
+    let argumentsValue;
+    try {
+      argumentsValue = JSON.parse(tool.arguments || '{}');
+    } catch {
+      throw new Error('The Anthropic provider stream contained malformed tool arguments.');
+    }
+    if (!argumentsValue || typeof argumentsValue !== 'object' || Array.isArray(argumentsValue)) {
+      throw new Error('The Anthropic provider stream contained invalid tool arguments.');
+    }
+    onEvent({ type: 'tool', ...tool });
+    state.tools.delete(value.index);
+  }
+  state.blocks.delete(value.index);
+}
+
+function handleMessageDelta(value, onEvent, state) {
+  requireContentPhase(state);
+  if (!value.delta || typeof value.delta !== 'object') {
+    throw new Error('Anthropic message_delta requires a delta.');
+  }
+  state.messageDeltaSeen = true;
+  const stopReason = value.delta?.stop_reason;
+  if (typeof stopReason !== 'string' || !stopReason.trim()) {
+    throw new Error('The Anthropic provider stream contained an invalid terminal stop reason.');
+  }
+  emitAnthropicUsage(onEvent, state.usage, value.usage);
+  state.stopReason = stopReason;
+}
+
+function handleMessageStop(res, onEvent, state, lifecycle) {
+  if (!state.messageStarted || !state.messageDeltaSeen) {
+    throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+  }
+  if (state.blocks.size || state.tools.size) {
+    throw new Error('The Anthropic provider stream ended with incomplete content blocks.');
+  }
+  if (state.stopReason) {
+    const mapping = stopReasonMapping(state.stopReason);
+    onEvent({
+      type: 'finish',
+      reason: mapping.normalized,
+      metadata: { anthropic: { stopReason: state.stopReason } },
+    });
+    writeChunk(res, undefined, undefined, {}, mapping.chat);
+  }
+  lifecycle.complete();
+}
+
+function requireContentPhase(state) {
+  if (!state.messageStarted || state.messageDeltaSeen) {
+    throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
   }
 }
 
@@ -1033,16 +1080,8 @@ function writeChunk(res, id, model, delta, finishReason = null) {
   })}\n\n`);
 }
 
-function mapStopReason(reason) {
-  if (reason === 'max_tokens') return 'length';
-  if (reason === 'tool_use') return 'tool_calls';
-  return reason ? 'stop' : null;
-}
-
-function mapNormalizedStopReason(reason) {
-  if (reason === 'max_tokens') return 'length';
-  if (reason === 'tool_use') return 'tool-calls';
-  return 'stop';
+function stopReasonMapping(reason) {
+  return STOP_REASON_MAPPINGS.get(reason) || DEFAULT_STOP_REASON_MAPPING;
 }
 
 function respondJson(res, status, payload) {
