@@ -60,7 +60,7 @@ function hasCredential(provider) {
   return Boolean(provider.apiKey || provider.bearerToken);
 }
 
-export function startRouter({ providers, upstreamOrigin, onEvent, port = 0, host = '127.0.0.1', reload }) {
+export function startRouter({ providers, upstreamOrigin, onEvent, port = 0, host = '127.0.0.1', reload, modelCatalogMode = 'append' }) {
   const build = (list) => buildCatalog(selectActiveProviders(list).map((provider) => ({
     ...provider,
     apiKey: provider.bearerToken || provider.apiKey,
@@ -87,7 +87,7 @@ export function startRouter({ providers, upstreamOrigin, onEvent, port = 0, host
   };
 
   const upstream = createUpstreamResolver({ explicit: upstreamOrigin });
-  const server = createRouter({ catalog: currentCatalog, upstream, onEvent });
+  const server = createRouter({ catalog: currentCatalog, upstream, onEvent, modelCatalogMode });
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);

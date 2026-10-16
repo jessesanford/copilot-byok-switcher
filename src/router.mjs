@@ -42,8 +42,9 @@ const defaultAdapters = createAdapterRegistry([
  * @param {object}   options.upstream  Resolver from createUpstreamResolver().
  * @param {function} [options.onEvent] Diagnostic callback: ({type, ...}) => void
  * @param {object} [options.adapters] Adapter registry with a resolve(kind) method.
+ * @param {'append'|'replace'} [options.modelCatalogMode] How GET /models combines catalogs.
  */
-export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, adapters = defaultAdapters, transport = https }) {
+export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, adapters = defaultAdapters, transport = https, modelCatalogMode = 'append' }) {
   const readCatalog = typeof catalog === 'function' ? catalog : () => catalog;
   const controllers = new Set();
 
@@ -65,7 +66,7 @@ export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, 
       .then(async (body) => {
         if (controller.signal.aborted) return;
         const origin = await resolver.resolve(req.headers.authorization);
-        return handle({ req, res, body, catalog: await readCatalog(), upstream: new URL(origin), onEvent, adapters, signal: controller.signal, transport });
+        return handle({ req, res, body, catalog: await readCatalog(), upstream: new URL(origin), onEvent, adapters, signal: controller.signal, transport, modelCatalogMode });
       })
       .catch((error) => {
         if (controller.signal.aborted || res.destroyed) return;
@@ -89,9 +90,9 @@ export function createRouter({ catalog, upstream: resolver, onEvent = () => {}, 
   return server;
 }
 
-async function handle({ req, res, body, catalog, upstream, onEvent, adapters, signal, transport }) {
+async function handle({ req, res, body, catalog, upstream, onEvent, adapters, signal, transport, modelCatalogMode }) {
   if (req.method === 'GET' && isModelsPath(req.url)) {
-    return injectModels({ req, res, body, catalog, upstream, onEvent, signal, transport });
+    return injectModels({ req, res, body, catalog, upstream, onEvent, signal, transport, modelCatalogMode });
   }
 
   if (req.method === 'POST' && body.length) {
@@ -126,7 +127,7 @@ function isModelsPath(url) {
 
 // ------------------------------------------------------------------ GET /models
 
-function injectModels({ req, res, body, catalog, upstream, onEvent, signal, transport = https }) {
+function injectModels({ req, res, body, catalog, upstream, onEvent, signal, transport = https, modelCatalogMode = 'append' }) {
   const headers = { ...req.headers, host: upstream.host };
   delete headers['accept-encoding']; // the response must be readable to be extended
 
@@ -135,11 +136,12 @@ function injectModels({ req, res, body, catalog, upstream, onEvent, signal, tran
     (upstreamRes) => {
       readAll(upstreamRes, MAX_MODELS_BYTES).then((raw) => {
         if (signal?.aborted || res.destroyed) return;
-        const merged = mergeModels(raw.toString('utf8'), catalog.entries);
+        const merged = mergeModels(raw.toString('utf8'), catalog.entries, { mode: modelCatalogMode });
         onEvent({
           type: 'models',
           status: upstreamRes.statusCode,
           injected: merged.injected,
+          removed: merged.removed || 0,
         });
 
         const outHeaders = { ...upstreamRes.headers };
@@ -166,8 +168,8 @@ function injectModels({ req, res, body, catalog, upstream, onEvent, signal, tran
   upstreamReq.end(body);
 }
 
-/** Appends the BYOK entries, leaving GitHub's response untouched if it is not the expected JSON. */
-export function mergeModels(payload, entries) {
+/** Combines the upstream catalog with entries, or replaces it with routed entries. */
+export function mergeModels(payload, entries, { mode = 'append' } = {}) {
   let json;
   try {
     json = JSON.parse(payload);
@@ -178,6 +180,12 @@ export function mergeModels(payload, entries) {
   const list = Array.isArray(json) ? json : json?.data;
   if (!Array.isArray(list)) return { payload, injected: 0 };
 
+  if (mode === 'replace') {
+    const removed = list.length;
+    list.splice(0, list.length, ...entries);
+    return { payload: JSON.stringify(json), injected: entries.length, removed };
+  }
+
   const known = new Set(list.map((model) => model?.id));
   let injected = 0;
   for (const entry of entries) {
@@ -186,7 +194,7 @@ export function mergeModels(payload, entries) {
     injected += 1;
   }
 
-  return { payload: JSON.stringify(json), injected };
+  return { payload: JSON.stringify(json), injected, removed: 0 };
 }
 
 // ------------------------------------------------------------------ passthrough

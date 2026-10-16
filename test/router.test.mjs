@@ -22,6 +22,13 @@ test('mergeModels supports a bare array payload', () => {
   assert.equal(JSON.parse(merged.payload).length, 2);
 });
 
+test('mergeModels can replace unrelated upstream entries', () => {
+  const payload = JSON.stringify({ data: [{ id: 'gpt-5.5' }, { id: 'claude' }] });
+  const merged = mergeModels(payload, [{ id: 'byok-sdc-gpt-6-sol' }], { mode: 'replace' });
+  assert.equal(merged.removed, 2);
+  assert.deepEqual(JSON.parse(merged.payload).data.map((model) => model.id), ['byok-sdc-gpt-6-sol']);
+});
+
 test('mergeModels leaves unexpected payloads untouched', () => {
   assert.deepEqual(mergeModels('not json', [{ id: 'x' }]), { payload: 'not json', injected: 0 });
   assert.deepEqual(mergeModels('{"error":"nope"}', [{ id: 'x' }]), { payload: '{"error":"nope"}', injected: 0 });
