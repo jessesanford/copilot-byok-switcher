@@ -428,9 +428,85 @@ test('Responses requests preserve ordered parallel tool history and outputs', as
       { role: 'assistant', content: [{ type: 'output_text', text: 'Checking' }] },
       { type: 'function_call', call_id: 'call_a', name: 'first', arguments: '{"value":1}' },
       { type: 'function_call', call_id: 'call_b', name: 'second', arguments: '{"value":2}' },
-      { type: 'function_call_output', call_id: 'call_a', output: 'one' },
+      {
+        type: 'function_call_output',
+        call_id: 'call_a',
+        output: [{ type: 'input_text', text: 'one' }],
+      },
       { type: 'function_call_output', call_id: 'call_b', output: 'two' },
     ]);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses requests preserve supported array-valued function output parts only', async () => {
+  let received;
+  const provider = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-output-parts', name: 'Responses output parts',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-output-parts', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-output-parts-gpt-6-output-parts',
+        input: [
+          {
+            type: 'function_call_output',
+            call_id: 'call_parts',
+            output: [
+              { type: 'text', text: 'legacy', private: true },
+              { type: 'input_text', text: 'native', __copilotMessageSource: 'local' },
+              { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'high', private: true },
+              { type: 'input_image', file_id: 'file-image', detail: 'low', unknown: true },
+              {
+                type: 'input_file',
+                file_id: 'file-id',
+                file_url: 'https://example.invalid/file',
+                file_data: 'ZmlsZQ==',
+                filename: 'result.txt',
+                private: true,
+              },
+              { type: 'private_part', secret: true },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(received.input, [{
+      type: 'function_call_output',
+      call_id: 'call_parts',
+      output: [
+        { type: 'input_text', text: 'legacy' },
+        { type: 'input_text', text: 'native' },
+        { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'high' },
+        { type: 'input_image', file_id: 'file-image', detail: 'low' },
+        {
+          type: 'input_file',
+          file_id: 'file-id',
+          file_url: 'https://example.invalid/file',
+          file_data: 'ZmlsZQ==',
+          filename: 'result.txt',
+        },
+      ],
+    }]);
   } finally {
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));

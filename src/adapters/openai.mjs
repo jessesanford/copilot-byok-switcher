@@ -508,14 +508,34 @@ function canonicalFunctionOutput(item) {
   }
   let output = item.output ?? '';
   if (Array.isArray(output)) {
-    output = output
-      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('');
+    output = output.map(canonicalFunctionOutputPart).filter(Boolean);
   } else if (typeof output !== 'string') {
     output = JSON.stringify(output);
   }
   return { type: 'function_call_output', call_id: item.call_id, output };
+}
+
+function canonicalFunctionOutputPart(part) {
+  if (!part || typeof part !== 'object') return undefined;
+  if (['text', 'input_text'].includes(part.type) && typeof part.text === 'string') {
+    return { type: 'input_text', text: part.text };
+  }
+  if (part.type === 'input_image') {
+    const image = { type: 'input_image' };
+    if (typeof part.image_url === 'string') image.image_url = part.image_url;
+    else if (typeof part.file_id === 'string') image.file_id = part.file_id;
+    else return undefined;
+    if (['low', 'high', 'auto'].includes(part.detail)) image.detail = part.detail;
+    return image;
+  }
+  if (part.type === 'input_file') {
+    const file = { type: 'input_file' };
+    for (const field of ['file_id', 'file_url', 'file_data', 'filename']) {
+      if (typeof part[field] === 'string') file[field] = part[field];
+    }
+    return Object.keys(file).length > 1 ? file : undefined;
+  }
+  return undefined;
 }
 
 function toResponsesTool(tool) {
