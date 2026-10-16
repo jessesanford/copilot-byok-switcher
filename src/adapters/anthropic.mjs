@@ -736,9 +736,12 @@ function translateSse(source, res, onEvent, lifecycle) {
   let buffer = '';
   const state = {
     blocks: new Map(),
+    seenBlocks: new Set(),
     tools: new Map(),
     usage: {},
     stopReason: undefined,
+    messageStarted: false,
+    messageDeltaSeen: false,
   };
   const fail = (message, options) => lifecycle.fail(new AdapterEventError(message, options));
   source.setEncoding('utf8');
@@ -801,10 +804,14 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     throw new Error('The Anthropic provider stream contained an invalid event shape.');
   }
   if (event === 'message_start') {
+    if (state.messageStarted) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     const { id, model, usage } = value.message || {};
     if (!value.message || typeof value.message !== 'object') {
       throw new Error('Anthropic message_start requires a message.');
     }
+    state.messageStarted = true;
     onEvent({
       type: 'metadata',
       namespace: 'anthropic',
@@ -813,14 +820,18 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     emitAnthropicUsage(onEvent, state.usage, usage);
     writeChunk(res, id, model, { role: 'assistant' });
   } else if (event === 'content_block_start') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     const block = value.content_block;
     if (!block?.type || !Number.isInteger(value.index) || value.index < 0) {
       throw new Error('Anthropic content_block_start requires a valid block and index.');
     }
     if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)
-      || state.blocks.has(value.index)) {
+      || state.seenBlocks.has(value.index)) {
       throw new Error('The Anthropic provider stream contained an invalid content block.');
     }
+    state.seenBlocks.add(value.index);
     state.blocks.set(value.index, block.type);
     const data = {
       contentBlock: { index: value.index, type: block.type },
@@ -848,17 +859,26 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
       }],
     });
   } else if (event === 'content_block_delta' && value.delta?.type === 'text_delta') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     if (state.blocks.get(value.index) !== 'text' || typeof value.delta.text !== 'string') {
       throw new Error('The Anthropic provider stream contained an invalid text delta.');
     }
     onEvent({ type: 'text', text: value.delta.text });
     writeChunk(res, undefined, undefined, { content: value.delta.text });
   } else if (event === 'content_block_delta' && value.delta?.type === 'thinking_delta') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.thinking !== 'string') {
       throw new Error('The Anthropic provider stream contained an invalid thinking delta.');
     }
     onEvent({ type: 'reasoning', text: value.delta.thinking });
   } else if (event === 'content_block_delta' && value.delta?.type === 'signature_delta') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.signature !== 'string') {
       throw new Error('The Anthropic provider stream contained an invalid signature delta.');
     }
@@ -874,6 +894,9 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
       },
     });
   } else if (event === 'content_block_delta' && value.delta?.type === 'input_json_delta') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     const tool = state.tools.get(value.index);
     if (state.blocks.get(value.index) !== 'tool_use'
       || !tool
@@ -894,6 +917,9 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
       }],
     });
   } else if (event === 'content_block_stop') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     const tool = state.tools.get(value.index);
     if (!Number.isInteger(value.index) || value.index < 0 || !state.blocks.has(value.index)) {
       throw new Error('The Anthropic provider stream contained an invalid content block stop.');
@@ -909,15 +935,22 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     }
     state.blocks.delete(value.index);
   } else if (event === 'message_delta') {
+    if (!state.messageStarted || state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     if (!value.delta || typeof value.delta !== 'object') {
       throw new Error('Anthropic message_delta requires a delta.');
     }
+    state.messageDeltaSeen = true;
     const stopReason = value.delta?.stop_reason;
     emitAnthropicUsage(onEvent, state.usage, value.usage);
     if (stopReason) state.stopReason = stopReason;
   } else if (event === 'error') {
     lifecycle.fail(anthropicStreamError(value.error));
   } else if (event === 'message_stop') {
+    if (!state.messageStarted || !state.messageDeltaSeen) {
+      throw new Error('The Anthropic provider stream contained an invalid message lifecycle.');
+    }
     if (state.blocks.size || state.tools.size) {
       throw new Error('The Anthropic provider stream ended with incomplete content blocks.');
     }

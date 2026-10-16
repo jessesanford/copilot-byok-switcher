@@ -231,6 +231,69 @@ test('Anthropic adapter rejects message_stop while content blocks remain open', 
   }
 });
 
+test('Anthropic adapter enforces the native message lifecycle', async (t) => {
+  const messageStart = anthropicFrame('message_start', {
+    type: 'message_start', message: { id: 'msg_lifecycle', model: 'claude-test' },
+  });
+  const messageDelta = anthropicFrame('message_delta', {
+    type: 'message_delta', delta: { stop_reason: 'end_turn' },
+  });
+  const cases = [
+    ['content before message start', [
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
+      }),
+    ]],
+    ['message delta before message start', [messageDelta]],
+    ['message stop before message start', [
+      anthropicFrame('message_stop', { type: 'message_stop' }),
+    ]],
+    ['duplicate message start', [messageStart, messageStart]],
+    ['message stop without message delta', [
+      messageStart,
+      anthropicFrame('message_stop', { type: 'message_stop' }),
+    ]],
+    ['duplicate message delta', [messageStart, messageDelta, messageDelta]],
+  ];
+
+  for (const [name, responseFrames] of cases) {
+    await t.test(name, async () => {
+      const { stream, events } = await relayAnthropicFrames(responseFrames);
+      const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+      assert.deepEqual(error, {
+        category: 'malformed-response',
+        message: 'The Anthropic provider stream contained an invalid message lifecycle.',
+        retryable: false,
+      });
+      assert.equal(events.filter((event) => event.type === 'finish').length, 0);
+      assert.equal(events.filter((event) => event.type === 'error').length, 1);
+    });
+  }
+});
+
+test('Anthropic adapter rejects reused content-block indexes', async () => {
+  const { stream, events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start', message: { id: 'msg_reused_index', model: 'claude-test' },
+    }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
+    }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' },
+    }),
+  ]);
+  const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+
+  assert.deepEqual(error, {
+    category: 'malformed-response',
+    message: 'The Anthropic provider stream contained an invalid content block.',
+    retryable: false,
+  });
+  assert.equal(events.filter((event) => event.type === 'error').length, 1);
+});
+
 test('Anthropic adapter rejects orphan and cross-type content deltas', async (t) => {
   const deltaCases = [
     ['orphan text', [], { type: 'text_delta', text: 'secret-text' }],
@@ -308,6 +371,9 @@ test('Anthropic adapter accepts CRLF multiline data frames', async () => {
   ].join('\r\n');
   const { stream, events } = await relayAnthropicFrames([
     frame,
+    anthropicFrame('message_delta', {
+      type: 'message_delta', delta: { stop_reason: 'end_turn' },
+    }).replaceAll('\n', '\r\n'),
     anthropicFrame('message_stop', { type: 'message_stop' }).replaceAll('\n', '\r\n'),
   ]);
 
