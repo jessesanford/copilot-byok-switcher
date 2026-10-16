@@ -92,6 +92,11 @@ test('Anthropic router acceptance: text uses the declared route, wire model, aut
     assert.equal(doneCount(stream), 1);
     assert.deepEqual(harness.events.find(({ type }) => type === 'route'), {
       type: 'route', provider: 'sdc', model: 'claude-acceptance', adapter: 'anthropic',
+      inboundPath: '/chat/completions',
+      outboundPath: '/v1/messages',
+      messageCount: 2,
+      toolCount: 1,
+      roles: ['system', 'user'],
     });
     const assembled = assembleAdapterEvents(harness.events.filter(isAdapterEvent));
     assert.equal(assembled.text, 'Hello router');
