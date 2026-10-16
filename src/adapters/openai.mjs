@@ -127,6 +127,13 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
 function relayResponsesStream(source, res, model) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   let buffer = '';
+  let finished = false;
+  const finish = (id = 'response') => {
+    if (finished) return;
+    finished = true;
+    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+    res.end('data: [DONE]\n\n');
+  };
   source.setEncoding('utf8');
   source.on('data', (chunk) => {
     buffer += chunk;
@@ -134,18 +141,24 @@ function relayResponsesStream(source, res, model) {
     buffer = frames.pop();
     for (const frame of frames) {
       const line = frame.split('\n').find((entry) => entry.startsWith('data:'));
-      if (!line) continue;
+      if (!line || finished) continue;
       const data = line.slice(5).trim();
       if (data === '[DONE]') {
-        res.write('data: [DONE]\n\n');
+        finish();
         continue;
       }
       let event;
       try { event = JSON.parse(data); } catch { continue; }
+      const id = event.response?.id || 'response';
       if (event.type === 'response.output_text.delta') {
-        res.write(`data: ${JSON.stringify({ id: event.response?.id || 'response', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: event.delta || '' }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: event.delta || '' }, finish_reason: null }] })}\n\n`);
+      } else if (event.type === 'response.completed' || event.type === 'response.done') {
+        finish(id);
       }
     }
+  });
+  source.on('end', () => {
+    if (!finished) finish();
   });
 }
 

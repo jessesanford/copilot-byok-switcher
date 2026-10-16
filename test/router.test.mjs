@@ -210,6 +210,38 @@ test('Responses requests translate prior assistant tool calls into function call
   }
 });
 
+test('Responses streams terminate with a Chat completion and close downstream', async () => {
+  const frames = [
+    'data: {"type":"response.output_text.delta","response":{"id":"resp-1"},"delta":"Today"}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp-1"}}\n\n',
+  ];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of frames) res.write(frame);
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-stream', name: 'Responses stream', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-stream', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-stream-gpt-6-stream', stream: true, messages: [{ role: 'user', content: 'date' }] }),
+    });
+    const text = await response.text();
+    assert.match(text, /finish_reason":"stop/);
+    assert.match(text, /data: \[DONE\]/);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('the adapter registry rejects duplicate kinds', () => {
   const adapter = { kind: 'native', forward() {} };
   assert.throws(
