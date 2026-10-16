@@ -8,20 +8,11 @@ const UNSUPPORTED_SETTINGS = [
   'frequency_penalty',
   'logit_bias',
   'logprobs',
-  'max_completion_tokens',
-  'max_output_tokens',
-  'max_tokens',
-  'n',
   'parallel_tool_calls',
   'presence_penalty',
   'reasoning_effort',
   'response_format',
-  'seed',
-  'stop',
-  'temperature',
-  'tool_choice',
   'top_logprobs',
-  'top_p',
 ];
 
 export function createGeminiAdapter({ providerIdleTimeoutMs }) {
@@ -127,28 +118,271 @@ function geminiTarget(route) {
 
 function toGeminiRequest(payload) {
   if (payload.stream !== true) {
-    throw invalidGeminiRequest('Gemini text requests require streaming.');
+    throw invalidGeminiRequest('Gemini requests require streaming.');
   }
-  if (!Array.isArray(payload.messages) || payload.messages.length !== 1) {
-    throw invalidGeminiRequest('Gemini text requests require exactly one user message.');
+  if (!Array.isArray(payload.messages) || !payload.messages.length) {
+    throw invalidGeminiRequest('Gemini requests require a non-empty messages array.');
   }
-  const [message] = payload.messages;
-  if (!message || typeof message !== 'object' || Array.isArray(message) || message.role !== 'user') {
-    throw invalidGeminiRequest('Gemini text requests require exactly one user message.');
+  const systemParts = [];
+  const contents = [];
+  const pendingCalls = new Map();
+  let conversationStarted = false;
+  for (const [index, message] of payload.messages.entries()) {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      throw invalidGeminiRequest(`Gemini message ${index + 1} must be an object.`);
+    }
+    if (message.role === 'system' || message.role === 'developer') {
+      if (conversationStarted) {
+        throw invalidGeminiRequest('Gemini system and developer messages must precede the conversation.');
+      }
+      systemParts.push(...geminiTextParts(message.content, message.role));
+    } else if (message.role === 'user') {
+      requireNoPendingCalls(pendingCalls, message.role);
+      conversationStarted = true;
+      contents.push({ role: 'user', parts: geminiTextParts(message.content, 'user') });
+    } else if (message.role === 'assistant') {
+      requireNoPendingCalls(pendingCalls, message.role);
+      conversationStarted = true;
+      const parts = geminiTextParts(message.content, 'assistant', true);
+      addGeminiCalls(parts, pendingCalls, message, index);
+      if (!parts.length) {
+        throw invalidGeminiRequest('Gemini assistant messages require usable content or function calls.');
+      }
+      contents.push({ role: 'model', parts });
+    } else if (message.role === 'tool' || message.role === 'function') {
+      conversationStarted = true;
+      contents.push({
+        role: 'user',
+        parts: [geminiFunctionResponse(message, pendingCalls)],
+      });
+    } else {
+      throw invalidGeminiRequest(`Gemini requests do not support the "${message.role}" message role.`);
+    }
   }
-  if (typeof message.content !== 'string' || !message.content) {
-    throw invalidGeminiRequest('Gemini user content must be a non-empty string.');
+  if (pendingCalls.size) {
+    throw invalidGeminiRequest('Gemini function calls require matching results before the conversation ends.');
   }
-  if (payload.tools !== undefined || payload.functions !== undefined) {
-    throw invalidGeminiRequest('Gemini text requests do not support tools.');
+  if (!contents.length) {
+    throw invalidGeminiRequest('Gemini requests require at least one conversation message.');
   }
   const setting = UNSUPPORTED_SETTINGS.find((name) => payload[name] !== undefined);
   if (setting) {
-    throw invalidGeminiRequest(`Gemini text requests do not support the "${setting}" setting.`);
+    throw invalidGeminiRequest(`Gemini requests do not support the "${setting}" setting.`);
   }
+  const tools = geminiTools(payload.tools, payload.functions);
+  const toolConfig = geminiToolConfig(payload.tool_choice, tools);
+  const generationConfig = geminiGenerationConfig(payload);
   return {
-    contents: [{ role: 'user', parts: [{ text: message.content }] }],
+    ...(systemParts.length ? { systemInstruction: { parts: systemParts } } : {}),
+    contents,
+    ...(Object.keys(generationConfig).length ? { generationConfig } : {}),
+    ...(tools.length ? { tools: [{ functionDeclarations: tools }] } : {}),
+    ...(toolConfig === undefined ? {} : { toolConfig }),
   };
+}
+
+function geminiTextParts(content, role, allowEmpty = false) {
+  if (content == null && allowEmpty) return [];
+  if (typeof content === 'string') {
+    if (!content && !allowEmpty) throw invalidGeminiRequest(`Gemini ${role} content must not be empty.`);
+    return content ? [{ text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    throw invalidGeminiRequest(`Gemini ${role} content must be a string or content array.`);
+  }
+  const parts = [];
+  for (const [index, part] of content.entries()) {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) {
+      throw invalidGeminiRequest(`Gemini ${role} content part ${index + 1} must be an object.`);
+    }
+    if (!['text', 'input_text', 'output_text'].includes(part.type) || typeof part.text !== 'string') {
+      throw invalidGeminiRequest(`Gemini ${role} content does not support the "${part.type}" part type.`);
+    }
+    if (part.text) parts.push({ text: part.text });
+  }
+  if (!parts.length && !allowEmpty) {
+    throw invalidGeminiRequest(`Gemini ${role} content requires usable text.`);
+  }
+  return parts;
+}
+
+function requireNoPendingCalls(pendingCalls, nextRole) {
+  if (pendingCalls.size) {
+    throw invalidGeminiRequest(`Gemini function calls require matching results before a "${nextRole}" message.`);
+  }
+}
+
+function addGeminiCalls(parts, pendingCalls, message, messageIndex) {
+  if (message.function_call != null && message.tool_calls !== undefined) {
+    throw invalidGeminiRequest('Gemini assistant messages cannot mix function_call and tool_calls.');
+  }
+  const calls = message.function_call == null
+    ? message.tool_calls
+    : [{
+        id: message.tool_call_id || message.call_id || message.id || `call_${messageIndex}`,
+        type: 'function',
+        function: message.function_call,
+        legacy: true,
+      }];
+  if (calls === undefined) return;
+  if (!Array.isArray(calls)) {
+    throw invalidGeminiRequest('Gemini assistant tool_calls must be an array.');
+  }
+  for (const [index, call] of calls.entries()) {
+    if (call?.type !== 'function' || !call.function || typeof call.function !== 'object') {
+      throw invalidGeminiRequest(`Gemini tool call ${index + 1} must be a function call.`);
+    }
+    if (typeof call.id !== 'string' || !call.id || pendingCalls.has(call.id)) {
+      throw invalidGeminiRequest('Gemini function calls require unique call IDs.');
+    }
+    const { name, arguments: serialized } = call.function;
+    if (typeof name !== 'string' || !name) {
+      throw invalidGeminiRequest(`Gemini function call "${call.id}" requires a name.`);
+    }
+    const args = parseJsonObject(serialized, `Gemini function call "${call.id}" arguments`);
+    parts.push({ functionCall: { name, args } });
+    pendingCalls.set(call.id, { name, legacy: Boolean(call.legacy) });
+  }
+}
+
+function geminiFunctionResponse(message, pendingCalls) {
+  const id = message.tool_call_id || message.call_id;
+  let call;
+  if (message.role === 'function' && id === undefined) {
+    const matches = [...pendingCalls.entries()].filter(([, value]) => value.name === message.name);
+    if (matches.length === 1) [call] = matches;
+  } else if (typeof id === 'string') {
+    call = [id, pendingCalls.get(id)];
+  }
+  if (!call?.[1]) {
+    throw invalidGeminiRequest('Gemini function results must match a pending call.');
+  }
+  const [callId, pending] = call;
+  if (message.name !== undefined && message.name !== pending.name) {
+    throw invalidGeminiRequest(`Gemini function result "${callId}" does not match function "${pending.name}".`);
+  }
+  pendingCalls.delete(callId);
+  return {
+    functionResponse: {
+      name: pending.name,
+      response: parseFunctionResponse(message.content),
+    },
+  };
+}
+
+function parseFunctionResponse(content) {
+  if (typeof content !== 'string') {
+    throw invalidGeminiRequest('Gemini function results require string content.');
+  }
+  try {
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : { result: parsed };
+  } catch {
+    return { result: content };
+  }
+}
+
+function geminiTools(tools, functions) {
+  if (tools !== undefined && functions !== undefined) {
+    throw invalidGeminiRequest('Gemini requests cannot mix tools and legacy functions.');
+  }
+  const definitions = functions === undefined ? tools : functions.map((value) => ({ type: 'function', function: value }));
+  if (definitions === undefined) return [];
+  if (!Array.isArray(definitions)) throw invalidGeminiRequest('Gemini tools must be an array.');
+  const names = new Set();
+  return definitions.map((tool, index) => {
+    if (tool?.type !== 'function' || !tool.function || typeof tool.function !== 'object') {
+      throw invalidGeminiRequest(`Gemini tool ${index + 1} must be a function declaration.`);
+    }
+    const { name, description, parameters } = tool.function;
+    if (typeof name !== 'string' || !name || names.has(name)) {
+      throw invalidGeminiRequest('Gemini function declarations require unique names.');
+    }
+    if (description !== undefined && typeof description !== 'string') {
+      throw invalidGeminiRequest(`Gemini function "${name}" description must be a string.`);
+    }
+    if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) {
+      throw invalidGeminiRequest(`Gemini function "${name}" requires a parameters schema.`);
+    }
+    names.add(name);
+    return { name, ...(description ? { description } : {}), parameters: structuredClone(parameters) };
+  });
+}
+
+function geminiToolConfig(choice, tools) {
+  if (choice === undefined) return undefined;
+  if (!tools.length) throw invalidGeminiRequest('Gemini tool_choice requires function declarations.');
+  let functionCallingConfig;
+  if (choice === 'auto') functionCallingConfig = { mode: 'AUTO' };
+  else if (choice === 'none') functionCallingConfig = { mode: 'NONE' };
+  else if (choice === 'required') functionCallingConfig = { mode: 'ANY' };
+  else if (choice?.type === 'function' && typeof choice.function?.name === 'string') {
+    if (!tools.some(({ name }) => name === choice.function.name)) {
+      throw invalidGeminiRequest(`Gemini tool_choice references unknown function "${choice.function.name}".`);
+    }
+    functionCallingConfig = { mode: 'ANY', allowedFunctionNames: [choice.function.name] };
+  } else {
+    throw invalidGeminiRequest('Gemini tool_choice must be auto, none, required, or a declared function.');
+  }
+  return { functionCallingConfig };
+}
+
+function geminiGenerationConfig(payload) {
+  const config = {};
+  optionalFinite(payload.temperature, 'temperature', 0, 2, (value) => { config.temperature = value; });
+  optionalFinite(payload.top_p, 'top_p', 0, 1, (value) => { config.topP = value; });
+  optionalInteger(payload.seed, 'seed', 0, Number.MAX_SAFE_INTEGER, (value) => { config.seed = value; });
+  const maxValues = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
+    .filter((name) => payload[name] !== undefined);
+  if (maxValues.length > 1) throw invalidGeminiRequest('Gemini requests cannot specify multiple maximum token settings.');
+  if (maxValues.length) {
+    optionalInteger(payload[maxValues[0]], maxValues[0], 1, Number.MAX_SAFE_INTEGER, (value) => {
+      config.maxOutputTokens = value;
+    });
+  }
+  if (payload.n !== undefined) {
+    optionalInteger(payload.n, 'n', 1, 8, (value) => { config.candidateCount = value; });
+  }
+  if (payload.stop !== undefined) {
+    const values = typeof payload.stop === 'string' ? [payload.stop] : payload.stop;
+    if (!Array.isArray(values) || !values.length || values.some((value) => typeof value !== 'string' || !value)) {
+      throw invalidGeminiRequest('Gemini stop must be a non-empty string or array of non-empty strings.');
+    }
+    config.stopSequences = [...values];
+  }
+  return config;
+}
+
+function optionalFinite(value, name, minimum, maximum, assign) {
+  if (value === undefined) return;
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw invalidGeminiRequest(`Gemini ${name} must be between ${minimum} and ${maximum}.`);
+  }
+  assign(value);
+}
+
+function optionalInteger(value, name, minimum, maximum, assign) {
+  if (value === undefined) return;
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw invalidGeminiRequest(`Gemini ${name} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  assign(value);
+}
+
+function parseJsonObject(value, label) {
+  if (typeof value !== 'string') throw invalidGeminiRequest(`${label} must be JSON.`);
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw invalidGeminiRequest(`${label} must be valid JSON.`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw invalidGeminiRequest(`${label} must decode to an object.`);
+  }
+  return parsed;
 }
 
 function translateSse(source, res, onEvent, lifecycle, streamId, model) {
