@@ -16,6 +16,7 @@ import https from 'node:https';
 
 import { AdapterEventError } from './adapters/events.mjs';
 import { createAnthropicAdapter } from './adapters/anthropic.mjs';
+import { createGeminiAdapter } from './adapters/gemini.mjs';
 import { createOpenAIAdapter } from './adapters/openai.mjs';
 import { createAdapterRegistry, UnsupportedAdapterError } from './adapters/registry.mjs';
 import { isByokModelId } from './catalog.mjs';
@@ -31,6 +32,7 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const PROVIDER_IDLE_TIMEOUT_MS = Number(process.env.COPILOT_BYOK_PROVIDER_TIMEOUT_MS) || 600_000;
 const defaultAdapters = createAdapterRegistry([
   createAnthropicAdapter({ providerIdleTimeoutMs: PROVIDER_IDLE_TIMEOUT_MS }),
+  createGeminiAdapter({ providerIdleTimeoutMs: PROVIDER_IDLE_TIMEOUT_MS }),
   createOpenAIAdapter({ providerIdleTimeoutMs: PROVIDER_IDLE_TIMEOUT_MS }),
 ]);
 
