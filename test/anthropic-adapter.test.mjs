@@ -271,6 +271,68 @@ test('Anthropic adapter translates base64 user and tool-result images in order',
   assert.deepEqual(body.tool_choice, { type: 'auto' });
 });
 
+test('Anthropic adapter preserves schema dialect keywords and valid numeric and combinator constraints', async () => {
+  const { body } = await captureAnthropicRequest({
+    model: 'byok-anthropic-claude-test',
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'measure',
+        parameters: {
+          type: 'object',
+          definitions: {
+            positive: { type: 'number', exclusiveMinimum: 0, multipleOf: 0.5 },
+          },
+          properties: {
+            value: {
+              allOf: [
+                { $ref: '#/definitions/positive' },
+                { anyOf: [{ maximum: 10 }, { const: 20 }] },
+              ],
+            },
+          },
+        },
+      },
+    }],
+    messages: [{ role: 'user', content: 'Measure it' }],
+  });
+  assert.deepEqual(body.tools[0].input_schema, {
+    type: 'object',
+    definitions: {
+      positive: { type: 'number', exclusiveMinimum: 0, multipleOf: 0.5 },
+    },
+    properties: {
+      value: {
+        allOf: [
+          { $ref: '#/definitions/positive' },
+          { anyOf: [{ maximum: 10 }, { const: 20 }] },
+        ],
+      },
+    },
+  });
+});
+
+test('Anthropic adapter avoids generated legacy call ID collisions with later explicit calls', async () => {
+  const { body } = await captureAnthropicRequest({
+    model: 'byok-anthropic-claude-test',
+    messages: [
+      { role: 'user', content: 'First' },
+      { role: 'assistant', content: '', function_call: { name: 'first', arguments: '{}' } },
+      { role: 'function', name: 'first', content: 'done' },
+      { role: 'assistant', content: '', tool_calls: [{
+        id: 'call_1',
+        type: 'function',
+        function: { name: 'second', arguments: '{}' },
+      }] },
+      { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+    ],
+  });
+  assert.equal(body.messages[1].content[0].id, 'call_1_2');
+  assert.equal(body.messages[2].content[0].tool_use_id, 'call_1_2');
+  assert.equal(body.messages[3].content[0].id, 'call_1');
+  assert.equal(body.messages[4].content[0].tool_use_id, 'call_1');
+});
+
 test('Anthropic adapter rejects malformed and unsupported request shapes without provider traffic', async (t) => {
   const invalidPayloads = [
     ['reported tool-role failure without a call', {
@@ -310,6 +372,20 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
       tools: [{ type: 'function', function: { name: 'go' } }],
       messages: [{ role: 'user', content: 'go' }],
     }],
+    ['non-positive schema multipleOf', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'number', multipleOf: 0 } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['empty schema combinator', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'object', allOf: [] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
     ['malformed schema properties', {
       tools: [{ type: 'function', function: { name: 'go', parameters: { type: 'object', properties: [] } } }],
       messages: [{ role: 'user', content: 'go' }],
@@ -334,6 +410,26 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
         { role: 'assistant', function_call: { name: 'go', arguments: '{}' } },
         { role: 'assistant', function_call: { name: 'go', arguments: '{}' } },
         { role: 'function', name: 'go', content: 'done' },
+      ],
+    }],
+    ['modern result using call_id fallback metadata', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+        { role: 'tool', call_id: 'call_1', content: 'done' },
+      ],
+    }],
+    ['modern result using id fallback metadata', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+        { role: 'tool', id: 'call_1', content: 'done' },
       ],
     }],
     ['unsupported image URL', {
@@ -375,6 +471,20 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
     }],
     ['empty conversation', {
       messages: [{ role: 'assistant', content: null }],
+    }],
+    ['empty standalone user turn', {
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'reply' },
+        { role: 'user', content: [] },
+      ],
+    }],
+    ['empty standalone assistant turn', {
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: [{ type: 'text', text: '' }] },
+        { role: 'user', content: 'second' },
+      ],
     }],
     ['mid-conversation system message', {
       messages: [

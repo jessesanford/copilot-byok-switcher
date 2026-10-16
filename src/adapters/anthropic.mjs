@@ -88,6 +88,7 @@ function toAnthropicRequest(payload, route) {
   const messages = [];
   const pendingCalls = new Map();
   const usedCallIds = new Set();
+  const reservedCallIds = collectExplicitCallIds(payload.messages);
   let conversationStarted = false;
   if (!Array.isArray(payload.messages)) {
     throw invalidAnthropicRequest('Anthropic requests require a messages array.');
@@ -105,14 +106,20 @@ function toAnthropicRequest(payload, route) {
       requireResolvedToolCalls(pendingCalls, message.role);
       conversationStarted = true;
       const content = canonicalContent(message.content, { role: 'user', allowImages: true });
-      if (content.length) messages.push({ role: 'user', content });
+      if (!content.length) {
+        throw invalidAnthropicRequest('Anthropic user messages require usable content.');
+      }
+      messages.push({ role: 'user', content });
     } else if (message.role === 'assistant') {
       requireResolvedToolCalls(pendingCalls, message.role);
       conversationStarted = true;
       const content = canonicalContent(message.content, { role: 'assistant', allowImages: false, allowEmpty: true });
-      addLegacyToolCall(content, pendingCalls, usedCallIds, message, index);
+      addLegacyToolCall(content, pendingCalls, usedCallIds, reservedCallIds, message, index);
       addModernToolCalls(content, pendingCalls, usedCallIds, message.tool_calls, index);
-      if (content.length) messages.push({ role: 'assistant', content });
+      if (!content.length) {
+        throw invalidAnthropicRequest('Anthropic assistant messages require usable content or tool calls.');
+      }
+      messages.push({ role: 'assistant', content });
     } else if (message.role === 'tool') {
       conversationStarted = true;
       messages.push({
@@ -211,19 +218,49 @@ function requireResolvedToolCalls(pendingCalls, nextRole) {
   }
 }
 
-function addLegacyToolCall(content, pendingCalls, usedCallIds, message, index) {
+function collectExplicitCallIds(messages) {
+  const ids = new Set();
+  if (!Array.isArray(messages)) return ids;
+  for (const message of messages) {
+    if (!message || typeof message !== 'object' || Array.isArray(message) || message.role !== 'assistant') continue;
+    for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+      if (typeof call?.id === 'string' && call.id) ids.add(call.id);
+    }
+    if (message.function_call != null) {
+      const id = firstDefined(message.tool_call_id, message.call_id, message.id);
+      if (typeof id === 'string' && id) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function addLegacyToolCall(content, pendingCalls, usedCallIds, reservedCallIds, message, index) {
   if (message.function_call == null) return;
   const call = message.function_call;
   if (!call || typeof call !== 'object' || Array.isArray(call)) {
     throw invalidAnthropicRequest('Anthropic legacy function calls must be objects.');
   }
-  const id = message.tool_call_id || message.call_id || message.id || `call_${index}`;
+  const explicitId = firstDefined(message.tool_call_id, message.call_id, message.id);
+  const id = explicitId === undefined
+    ? generatedCallId(index, usedCallIds, reservedCallIds)
+    : explicitId;
   addToolUse(content, pendingCalls, usedCallIds, {
     id,
     name: call.name,
     arguments: call.arguments,
     legacy: true,
   });
+}
+
+function generatedCallId(index, usedCallIds, reservedCallIds) {
+  const base = `call_${index}`;
+  let id = base;
+  let suffix = 2;
+  while (usedCallIds.has(id) || reservedCallIds.has(id)) {
+    id = `${base}_${suffix}`;
+    suffix += 1;
+  }
+  return id;
 }
 
 function addModernToolCalls(content, pendingCalls, usedCallIds, calls, messageIndex) {
@@ -272,7 +309,9 @@ function addToolUse(content, pendingCalls, usedCallIds, call) {
 }
 
 function canonicalToolResult(message, pendingCalls, legacy) {
-  const explicitId = message.tool_call_id || message.call_id || message.id;
+  const explicitId = legacy
+    ? firstDefined(message.tool_call_id, message.call_id, message.id)
+    : message.tool_call_id;
   let call;
   if (explicitId !== undefined) {
     if (typeof explicitId !== 'string' || !explicitId) {
@@ -305,6 +344,10 @@ function canonicalToolResult(message, pendingCalls, legacy) {
     tool_use_id: call.id,
     content: content.length ? content : '',
   };
+}
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined);
 }
 
 function canonicalTools(tools, functions) {
@@ -374,6 +417,9 @@ function canonicalJsonSchema(schema) {
       if (typeof schema[key] !== 'number' || !Number.isFinite(schema[key])) {
         throw invalidAnthropicRequest(`Anthropic JSON Schema "${key}" must be a finite number.`);
       }
+      if (key === 'multipleOf' && schema[key] <= 0) {
+        throw invalidAnthropicRequest('Anthropic JSON Schema "multipleOf" must be greater than zero.');
+      }
       result[key] = schema[key];
     }
   }
@@ -418,6 +464,9 @@ function canonicalJsonSchema(schema) {
       if (!Array.isArray(schema[key])) {
         throw invalidAnthropicRequest(`Anthropic JSON Schema "${key}" must be an array.`);
       }
+      if (key !== 'prefixItems' && !schema[key].length) {
+        throw invalidAnthropicRequest(`Anthropic JSON Schema "${key}" must not be empty.`);
+      }
       result[key] = schema[key].map(canonicalJsonSchema);
     }
   }
@@ -433,7 +482,7 @@ function canonicalJsonSchema(schema) {
       result[key] = canonicalJsonSchema(schema[key]);
     }
   }
-  for (const key of ['properties', 'patternProperties', '$defs', 'dependentSchemas']) {
+  for (const key of ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']) {
     if (schema[key] !== undefined) {
       if (!schema[key] || typeof schema[key] !== 'object' || Array.isArray(schema[key])) {
         throw invalidAnthropicRequest(`Anthropic JSON Schema "${key}" must be an object.`);
