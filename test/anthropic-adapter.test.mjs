@@ -81,6 +81,7 @@ test('Anthropic adapter translates modern tools, results, schemas, and choices w
           type: 'object',
           properties: {
             'x-private-name': { type: 'string', private: true },
+            nullable: { type: ['string', 'null'] },
           },
           required: ['x-private-name'],
           private: true,
@@ -141,7 +142,10 @@ test('Anthropic adapter translates modern tools, results, schemas, and choices w
       description: 'Look up a record',
       input_schema: {
         type: 'object',
-        properties: { 'x-private-name': { type: 'string' } },
+        properties: {
+          'x-private-name': { type: 'string' },
+          nullable: { type: ['string', 'null'] },
+        },
         required: ['x-private-name'],
       },
     }],
@@ -202,6 +206,10 @@ test('Anthropic adapter translates base64 user and tool-result images in order',
   const { body } = await captureAnthropicRequest({
     model: 'byok-anthropic-claude-test',
     tool_choice: 'auto',
+    tools: [
+      { type: 'function', function: { name: 'first', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'second', parameters: { type: 'object' } } },
+    ],
     messages: [
       {
         role: 'user',
@@ -274,6 +282,18 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
         { role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{' } }] },
       ],
     }],
+    ['missing modern arguments', {
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go' } }] },
+      ],
+    }],
+    ['missing legacy arguments', {
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', function_call: { name: 'go' } },
+      ],
+    }],
     ['missing call ID', {
       messages: [
         { role: 'user', content: 'go' },
@@ -288,6 +308,24 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
     }],
     ['missing function schema', {
       tools: [{ type: 'function', function: { name: 'go' } }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['malformed schema properties', {
+      tools: [{ type: 'function', function: { name: 'go', parameters: { type: 'object', properties: [] } } }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['malformed nested schema', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'object', properties: { value: 'string' } } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['malformed schema required', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'object', required: ['value', 1] } },
+      }],
       messages: [{ role: 'user', content: 'go' }],
     }],
     ['ambiguous legacy result', {
@@ -318,6 +356,10 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
       tool_choice: 'required',
       messages: [{ role: 'user', content: 'go' }],
     }],
+    ['auto tool choice without tools', {
+      tool_choice: 'auto',
+      messages: [{ role: 'user', content: 'go' }],
+    }],
     ['tool choice missing a name', {
       tool_choice: { type: 'function', function: {} },
       messages: [{ role: 'user', content: 'go' }],
@@ -333,6 +375,62 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
     }],
     ['empty conversation', {
       messages: [{ role: 'assistant', content: null }],
+    }],
+    ['mid-conversation system message', {
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'system', content: 'late instruction' },
+      ],
+    }],
+    ['unresolved tool call at conversation end', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+      ],
+    }],
+    ['tool call interrupted by user message', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+        { role: 'user', content: 'continue' },
+        { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+      ],
+    }],
+    ['parallel tool results interrupted before completion', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [
+            { id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } },
+            { id: 'call_2', type: 'function', function: { name: 'go', arguments: '{}' } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: 'one' },
+        { role: 'assistant', content: 'interrupt' },
+        { role: 'tool', tool_call_id: 'call_2', content: 'two' },
+      ],
+    }],
+    ['reused tool call ID after its result', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: 'again' },
+      ],
     }],
   ];
   for (const [name, payload] of invalidPayloads) {
