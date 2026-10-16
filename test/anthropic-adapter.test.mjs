@@ -16,8 +16,10 @@ test('Anthropic providers default to the native Anthropic adapter', async () => 
 
 const frames = [
   'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"claude-test"}}\n\n',
-  'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello "}}\n\n',
-  'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}\n\n',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+  'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}\n\n',
+  'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}\n\n',
+  'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
   'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
   'event: message_stop\ndata: {"type":"message_stop"}\n\n',
 ];
@@ -102,10 +104,47 @@ test('Anthropic adapter maps native HTTP failures to safe typed responses', asyn
   }
 });
 
+test('Anthropic adapter maps HTTP 413 to a non-retryable invalid request', async () => {
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(413, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'sensitive request details' } }));
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-anthropic-claude-test',
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 413);
+    assert.deepEqual(JSON.parse(body).error, {
+      category: 'invalid-request',
+      message: 'The Anthropic provider rejected the request as too large.',
+      retryable: false,
+      status: 413,
+    });
+    assert.doesNotMatch(body, /sensitive request details/);
+    assert.equal(events.filter((event) => event.type === 'error').length, 1);
+  } finally {
+    await close(router);
+    await close(provider);
+  }
+});
+
 test('Anthropic adapter preserves partial output then terminates once on native SSE errors', async () => {
   const { stream, events } = await relayAnthropicFrames([
     anthropicFrame('message_start', {
       type: 'message_start', message: { id: 'msg_error', model: 'claude-test' },
+    }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
     }),
     anthropicFrame('content_block_delta', {
       type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' },
@@ -132,6 +171,131 @@ test('Anthropic adapter preserves partial output then terminates once on native 
   assert.equal(events.filter((event) => event.type === 'error').length, 1);
   assert.equal(events.filter((event) => event.type === 'finish').length, 0);
   assert.doesNotMatch(stream, /provider internals/);
+});
+
+test('Anthropic adapter does not commit finish before message_stop', async () => {
+  const { stream, events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start', message: { id: 'msg_early_finish', model: 'claude-test' },
+    }),
+    anthropicFrame('message_delta', {
+      type: 'message_delta', delta: { stop_reason: 'end_turn' },
+    }),
+  ]);
+  const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+
+  assert.equal(error.category, 'truncated');
+  assert.doesNotMatch(stream, /"finish_reason":"stop"/);
+  assert.equal(events.filter((event) => event.type === 'finish').length, 0);
+  assert.equal(events.filter((event) => event.type === 'error').length, 1);
+});
+
+test('Anthropic adapter rejects message_stop while content blocks remain open', async (t) => {
+  const cases = [
+    ['text block', [
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
+      }),
+    ]],
+    ['incomplete tool block', [
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tool_open', name: 'lookup', input: {} },
+      }),
+      anthropicFrame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"city":' },
+      }),
+    ]],
+  ];
+  for (const [name, blockFrames] of cases) {
+    await t.test(name, async () => {
+      const { stream, events } = await relayAnthropicFrames([
+        anthropicFrame('message_start', {
+          type: 'message_start', message: { id: 'msg_open', model: 'claude-test' },
+        }),
+        ...blockFrames,
+        anthropicFrame('message_delta', {
+          type: 'message_delta', delta: { stop_reason: 'end_turn' },
+        }),
+        anthropicFrame('message_stop', { type: 'message_stop' }),
+      ]);
+      const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+      assert.equal(error.category, 'malformed-response');
+      assert.equal(error.message, 'The Anthropic provider stream ended with incomplete content blocks.');
+      assert.equal(events.filter((event) => event.type === 'finish').length, 0);
+      assert.equal(events.filter((event) => event.type === 'error').length, 1);
+    });
+  }
+});
+
+test('Anthropic adapter rejects orphan and cross-type content deltas', async (t) => {
+  const deltaCases = [
+    ['orphan text', [], { type: 'text_delta', text: 'secret-text' }],
+    ['cross-type text', [{ type: 'thinking', thinking: '' }], { type: 'text_delta', text: 'secret-text' }],
+    ['orphan thinking', [], { type: 'thinking_delta', thinking: 'secret-thinking' }],
+    ['cross-type thinking', [{ type: 'text', text: '' }], { type: 'thinking_delta', thinking: 'secret-thinking' }],
+    ['orphan signature', [], { type: 'signature_delta', signature: 'secret-signature' }],
+    ['cross-type signature', [{ type: 'text', text: '' }], { type: 'signature_delta', signature: 'secret-signature' }],
+  ];
+  for (const [name, blocks, delta] of deltaCases) {
+    await t.test(name, async () => {
+      const starts = blocks.map((contentBlock, index) => anthropicFrame('content_block_start', {
+        type: 'content_block_start', index, content_block: contentBlock,
+      }));
+      const { stream, events } = await relayAnthropicFrames([
+        anthropicFrame('message_start', {
+          type: 'message_start', message: { id: 'msg_delta', model: 'claude-test' },
+        }),
+        ...starts,
+        anthropicFrame('content_block_delta', {
+          type: 'content_block_delta', index: 0, delta,
+        }),
+      ]);
+      const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+      assert.equal(error.category, 'malformed-response');
+      assert.match(error.message, /^The Anthropic provider stream contained an invalid (text|thinking|signature) delta\.$/);
+      assert.doesNotMatch(error.message, /secret-/);
+      assert.equal(events.filter((event) => event.type === 'error').length, 1);
+    });
+  }
+});
+
+test('Anthropic adapter sanitizes provider-controlled identifiers and event names in diagnostics', async (t) => {
+  await t.test('tool identifier', async () => {
+    const { stream, events } = await relayAnthropicFrames([
+      anthropicFrame('message_start', {
+        type: 'message_start', message: { id: 'msg_tool', model: 'claude-test' },
+      }),
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'sensitive-tool-id', name: 'lookup', input: {} },
+      }),
+      anthropicFrame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"broken"' },
+      }),
+      anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    ]);
+    const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+    assert.equal(error.message, 'The Anthropic provider stream contained malformed tool arguments.');
+    assert.doesNotMatch(error.message, /sensitive-tool-id/);
+    assert.doesNotMatch(events.find((event) => event.type === 'error').error.message, /sensitive-tool-id/);
+  });
+
+  await t.test('event name', async () => {
+    const { stream, events } = await relayAnthropicFrames([
+      anthropicFrame('sensitive-event-name', { type: 'sensitive-event-name' }),
+    ]);
+    const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+    assert.equal(error.message, 'The Anthropic provider stream contained an unsupported event.');
+    assert.doesNotMatch(error.message, /sensitive-event-name/);
+    assert.doesNotMatch(events.find((event) => event.type === 'error').error.message, /sensitive-event-name/);
+  });
 });
 
 test('Anthropic adapter accepts CRLF multiline data frames', async () => {
@@ -174,6 +338,9 @@ test('Anthropic adapter turns a stalled partial stream into one timeout and abor
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(anthropicFrame('message_start', {
       type: 'message_start', message: { id: 'msg_timeout', model: 'claude-test' },
+    }));
+    res.write(anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
     }));
     res.write(anthropicFrame('content_block_delta', {
       type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' },
@@ -328,18 +495,26 @@ test('Anthropic adapter assembles fragmented and interleaved native tool streams
 test('Anthropic adapter preserves mixed text, empty tools, and message-stop terminal ordering', async () => {
   const mixedFrames = [
     anthropicFrame('message_start', { type: 'message_start', message: { id: 'msg_mixed', model: 'claude-test' } }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
+    }),
     anthropicFrame('content_block_delta', {
       type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'before' },
     }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
     anthropicFrame('content_block_start', {
       type: 'content_block_start',
       index: 1,
       content_block: { type: 'tool_use', id: 'tool_empty', name: 'empty', input: {} },
     }),
     anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 1 }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 2, content_block: { type: 'text', text: '' },
+    }),
     anthropicFrame('content_block_delta', {
       type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'after' },
     }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 2 }),
     anthropicFrame('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
     anthropicFrame('message_stop', { type: 'message_stop' }),
   ];
@@ -403,16 +578,24 @@ test('Anthropic adapter preserves thinking, signatures, redactions, identity, an
       index: 0,
       delta: { type: 'signature_delta', signature },
     }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
     anthropicFrame('content_block_start', {
       type: 'content_block_start',
       index: 1,
       content_block: { type: 'redacted_thinking', data: redactedPayload },
+    }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 1 }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 2,
+      content_block: { type: 'text', text: '' },
     }),
     anthropicFrame('content_block_delta', {
       type: 'content_block_delta',
       index: 2,
       delta: { type: 'text_delta', text: 'Visible answer' },
     }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 2 }),
     anthropicFrame('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'pause_turn' },
@@ -446,6 +629,7 @@ test('Anthropic adapter preserves thinking, signatures, redactions, identity, an
       contentBlock: { index: 1, type: 'redacted_thinking' },
       redactedThinking: redactedPayload,
     },
+    { contentBlock: { index: 2, type: 'text' } },
     { stopReason: 'pause_turn' },
   ]);
   assert.deepEqual(assembled.finishes, ['stop']);

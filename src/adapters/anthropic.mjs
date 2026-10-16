@@ -156,6 +156,7 @@ function anthropicHttpError(status = 502) {
     404: ['not-found', false, 'The Anthropic provider endpoint was not found.'],
     408: ['timeout', true, 'The Anthropic provider timed out.'],
     409: ['upstream', true, 'The Anthropic provider could not complete the request.'],
+    413: ['invalid-request', false, 'The Anthropic provider rejected the request as too large.'],
     429: ['rate-limit', true, 'The Anthropic provider rate limit was exceeded.'],
   };
   const [category, retryable, message] = definitions[status]
@@ -737,6 +738,7 @@ function translateSse(source, res, onEvent, lifecycle) {
     blocks: new Map(),
     tools: new Map(),
     usage: {},
+    stopReason: undefined,
   };
   const fail = (message, options) => lifecycle.fail(new AdapterEventError(message, options));
   source.setEncoding('utf8');
@@ -815,6 +817,10 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     if (!block?.type || !Number.isInteger(value.index) || value.index < 0) {
       throw new Error('Anthropic content_block_start requires a valid block and index.');
     }
+    if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)
+      || state.blocks.has(value.index)) {
+      throw new Error('The Anthropic provider stream contained an invalid content block.');
+    }
     state.blocks.set(value.index, block.type);
     const data = {
       contentBlock: { index: value.index, type: block.type },
@@ -842,29 +848,37 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
       }],
     });
   } else if (event === 'content_block_delta' && value.delta?.type === 'text_delta') {
-    if (typeof value.delta.text !== 'string') throw new Error('Anthropic text deltas require text.');
+    if (state.blocks.get(value.index) !== 'text' || typeof value.delta.text !== 'string') {
+      throw new Error('The Anthropic provider stream contained an invalid text delta.');
+    }
     onEvent({ type: 'text', text: value.delta.text });
     writeChunk(res, undefined, undefined, { content: value.delta.text });
   } else if (event === 'content_block_delta' && value.delta?.type === 'thinking_delta') {
-    if (typeof value.delta.thinking !== 'string') throw new Error('Anthropic thinking deltas require text.');
+    if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.thinking !== 'string') {
+      throw new Error('The Anthropic provider stream contained an invalid thinking delta.');
+    }
     onEvent({ type: 'reasoning', text: value.delta.thinking });
   } else if (event === 'content_block_delta' && value.delta?.type === 'signature_delta') {
-    if (typeof value.delta.signature !== 'string') throw new Error('Anthropic signature deltas require a signature.');
+    if (state.blocks.get(value.index) !== 'thinking' || typeof value.delta.signature !== 'string') {
+      throw new Error('The Anthropic provider stream contained an invalid signature delta.');
+    }
     onEvent({
       type: 'metadata',
       namespace: 'anthropic',
       data: {
         contentBlock: {
           index: value.index,
-          type: state.blocks.get(value.index) || 'thinking',
+          type: 'thinking',
         },
         signature: value.delta.signature,
       },
     });
   } else if (event === 'content_block_delta' && value.delta?.type === 'input_json_delta') {
     const tool = state.tools.get(value.index);
-    if (!tool || typeof value.delta.partial_json !== 'string') {
-      throw new Error('Anthropic tool deltas require a known tool and JSON fragment.');
+    if (state.blocks.get(value.index) !== 'tool_use'
+      || !tool
+      || typeof value.delta.partial_json !== 'string') {
+      throw new Error('The Anthropic provider stream contained an invalid tool delta.');
     }
     tool.arguments += value.delta.partial_json;
     onEvent({
@@ -881,37 +895,43 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     });
   } else if (event === 'content_block_stop') {
     const tool = state.tools.get(value.index);
-    if (!Number.isInteger(value.index) || value.index < 0) {
-      throw new Error('Anthropic content_block_stop requires a valid index.');
+    if (!Number.isInteger(value.index) || value.index < 0 || !state.blocks.has(value.index)) {
+      throw new Error('The Anthropic provider stream contained an invalid content block stop.');
     }
-    if (!tool) return;
-    try {
-      JSON.parse(tool.arguments || '{}');
-    } catch {
-      throw new Error(`Anthropic tool call "${tool.id}" produced malformed arguments.`);
+    if (tool) {
+      try {
+        JSON.parse(tool.arguments || '{}');
+      } catch {
+        throw new Error('The Anthropic provider stream contained malformed tool arguments.');
+      }
+      onEvent({ type: 'tool', ...tool });
+      state.tools.delete(value.index);
     }
-    onEvent({ type: 'tool', ...tool });
-    state.tools.delete(value.index);
+    state.blocks.delete(value.index);
   } else if (event === 'message_delta') {
     if (!value.delta || typeof value.delta !== 'object') {
       throw new Error('Anthropic message_delta requires a delta.');
     }
     const stopReason = value.delta?.stop_reason;
     emitAnthropicUsage(onEvent, state.usage, value.usage);
-    if (stopReason) {
-      onEvent({
-        type: 'finish',
-        reason: mapNormalizedStopReason(stopReason),
-        metadata: { anthropic: { stopReason } },
-      });
-    }
-    writeChunk(res, undefined, undefined, {}, mapStopReason(stopReason));
+    if (stopReason) state.stopReason = stopReason;
   } else if (event === 'error') {
     lifecycle.fail(anthropicStreamError(value.error));
   } else if (event === 'message_stop') {
+    if (state.blocks.size || state.tools.size) {
+      throw new Error('The Anthropic provider stream ended with incomplete content blocks.');
+    }
+    if (state.stopReason) {
+      onEvent({
+        type: 'finish',
+        reason: mapNormalizedStopReason(state.stopReason),
+        metadata: { anthropic: { stopReason: state.stopReason } },
+      });
+      writeChunk(res, undefined, undefined, {}, mapStopReason(state.stopReason));
+    }
     lifecycle.complete();
   } else if (event !== 'ping' && event !== 'content_block_delta') {
-    throw new Error(`The Anthropic provider stream contained unsupported event "${event}".`);
+    throw new Error('The Anthropic provider stream contained an unsupported event.');
   } else if (event === 'content_block_delta') {
     throw new Error('The Anthropic provider stream contained an unsupported content delta.');
   }

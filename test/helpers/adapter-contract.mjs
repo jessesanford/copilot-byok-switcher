@@ -170,6 +170,9 @@ async function truncation(options = {}) {
       res.write(anthropicFrame('message_start', {
         type: 'message_start', message: { id: 'msg_contract', model: 'truncated' },
       }));
+      res.write(anthropicFrame('content_block_start', {
+        type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
+      }));
       res.write(anthropicFrame('content_block_delta', {
         type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' },
       }));
@@ -293,8 +296,14 @@ function anthropicTracerFrames() {
     anthropicFrame('message_start', {
       type: 'message_start', message: { id: 'msg_contract', model: 'trace-model' },
     }, '\r\n'),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' },
+    }, '\r\n'),
     anthropicFrame('content_block_delta', {
       type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Checking ' },
+    }, '\r\n'),
+    anthropicFrame('content_block_stop', {
+      type: 'content_block_stop', index: 0,
     }, '\r\n'),
     anthropicFrame('content_block_start', {
       type: 'content_block_start',
