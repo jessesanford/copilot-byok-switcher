@@ -86,28 +86,339 @@ function forwardAnthropic({ res, payload, route, onEvent, providerIdleTimeoutMs,
 function toAnthropicRequest(payload, route) {
   const system = [];
   const messages = [];
-  for (const message of payload.messages || []) {
-    const content = textContent(message.content);
-    if (message.role === 'system') system.push(content);
-    else if (message.role === 'user' || message.role === 'assistant') messages.push({ role: message.role, content });
-    else throw new TypeError(`Anthropic text streaming does not support the "${message.role}" message role.`);
+  const pendingCalls = new Map();
+  if (!Array.isArray(payload.messages)) {
+    throw invalidAnthropicRequest('Anthropic requests require a messages array.');
   }
-  if (!messages.length) throw new TypeError('Anthropic requests require at least one user or assistant message.');
+  for (const [index, message] of payload.messages.entries()) {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      throw invalidAnthropicRequest(`Anthropic message ${index + 1} must be an object.`);
+    }
+    if (message.role === 'system' || message.role === 'developer') {
+      system.push(...canonicalContent(message.content, { role: message.role, allowImages: false }));
+    } else if (message.role === 'user') {
+      const content = canonicalContent(message.content, { role: 'user', allowImages: true });
+      if (content.length) messages.push({ role: 'user', content });
+    } else if (message.role === 'assistant') {
+      const content = canonicalContent(message.content, { role: 'assistant', allowImages: false, allowEmpty: true });
+      addLegacyToolCall(content, pendingCalls, message, index);
+      addModernToolCalls(content, pendingCalls, message.tool_calls, index);
+      if (content.length) messages.push({ role: 'assistant', content });
+    } else if (message.role === 'tool') {
+      messages.push({
+        role: 'user',
+        content: [canonicalToolResult(message, pendingCalls, false)],
+      });
+    } else if (message.role === 'function') {
+      messages.push({
+        role: 'user',
+        content: [canonicalToolResult(message, pendingCalls, true)],
+      });
+    } else {
+      throw invalidAnthropicRequest(`Anthropic requests do not support the "${message.role}" message role.`);
+    }
+  }
+  if (!messages.length) {
+    throw invalidAnthropicRequest('Anthropic requests require at least one usable user or assistant message.');
+  }
+
+  const tools = canonicalTools(payload.tools, payload.functions);
+  const toolChoice = canonicalToolChoice(payload.tool_choice, tools);
   return {
     model: route.wireModel,
-    ...(system.length ? { system: system.join('\n') } : {}),
+    ...(system.length ? { system } : {}),
     messages,
-    max_tokens: payload.max_tokens ?? route.model.maxOutputTokens ?? 4096,
+    max_tokens: canonicalMaxTokens(payload, route),
     stream: true,
+    ...(tools.length ? { tools } : {}),
+    ...(toolChoice === undefined ? {} : { tool_choice: toolChoice }),
   };
 }
 
-function textContent(content) {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content) && content.every((part) => part?.type === 'text' && typeof part.text === 'string')) {
-    return content.map((part) => part.text).join('');
+function canonicalContent(content, { role, allowImages, allowEmpty = false }) {
+  if (content == null && allowEmpty) return [];
+  if (typeof content === 'string') {
+    return content ? [{ type: 'text', text: content }] : [];
   }
-  throw new TypeError('Anthropic text streaming supports only text message content.');
+  if (!Array.isArray(content)) {
+    throw invalidAnthropicRequest(`Anthropic ${role} content must be a string or content array.`);
+  }
+  const blocks = [];
+  for (const [index, part] of content.entries()) {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) {
+      throw invalidAnthropicRequest(`Anthropic ${role} content part ${index + 1} must be an object.`);
+    }
+    if (['text', 'input_text', 'output_text'].includes(part.type)) {
+      if (typeof part.text !== 'string') {
+        throw invalidAnthropicRequest(`Anthropic ${role} text content requires a string.`);
+      }
+      if (part.text) blocks.push({ type: 'text', text: part.text });
+    } else if (part.type === 'image_url' || part.type === 'input_image') {
+      if (!allowImages) {
+        throw invalidAnthropicRequest(`Anthropic ${role} content does not support images.`);
+      }
+      blocks.push(canonicalImage(part));
+    } else {
+      throw invalidAnthropicRequest(`Anthropic ${role} content does not support the "${part.type}" part type.`);
+    }
+  }
+  return blocks;
+}
+
+function canonicalImage(part) {
+  const value = part.type === 'image_url'
+    ? (typeof part.image_url === 'string' ? part.image_url : part.image_url?.url)
+    : part.image_url;
+  if (typeof value !== 'string') {
+    throw invalidAnthropicRequest('Anthropic images require a base64 data URL.');
+  }
+  const match = /^data:(image\/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(value);
+  if (!match || !isCanonicalBase64(match[2])) {
+    throw invalidAnthropicRequest('Anthropic images require valid JPEG, PNG, GIF, or WebP base64 data.');
+  }
+  return {
+    type: 'image',
+    source: { type: 'base64', media_type: match[1], data: match[2] },
+  };
+}
+
+function isCanonicalBase64(value) {
+  if (!value || value.length % 4 !== 0) return false;
+  try {
+    return Buffer.from(value, 'base64').toString('base64') === value;
+  } catch {
+    return false;
+  }
+}
+
+function addLegacyToolCall(content, pendingCalls, message, index) {
+  if (message.function_call == null) return;
+  const call = message.function_call;
+  if (!call || typeof call !== 'object' || Array.isArray(call)) {
+    throw invalidAnthropicRequest('Anthropic legacy function calls must be objects.');
+  }
+  const id = message.tool_call_id || message.call_id || message.id || `call_${index}`;
+  addToolUse(content, pendingCalls, {
+    id,
+    name: call.name,
+    arguments: call.arguments,
+    legacy: true,
+  });
+}
+
+function addModernToolCalls(content, pendingCalls, calls, messageIndex) {
+  if (calls === undefined) return;
+  if (!Array.isArray(calls)) {
+    throw invalidAnthropicRequest('Anthropic assistant tool_calls must be an array.');
+  }
+  for (const [callIndex, call] of calls.entries()) {
+    if (call?.type !== 'function' || !call.function || typeof call.function !== 'object') {
+      throw invalidAnthropicRequest(`Anthropic tool call ${callIndex + 1} in message ${messageIndex + 1} must be a function call.`);
+    }
+    addToolUse(content, pendingCalls, {
+      id: call.id,
+      name: call.function.name,
+      arguments: call.function.arguments,
+      legacy: false,
+    });
+  }
+}
+
+function addToolUse(content, pendingCalls, call) {
+  if (typeof call.id !== 'string' || !call.id) {
+    throw invalidAnthropicRequest('Anthropic tool calls require a call ID.');
+  }
+  if (pendingCalls.has(call.id)) {
+    throw invalidAnthropicRequest(`Anthropic tool call ID "${call.id}" is duplicated.`);
+  }
+  if (typeof call.name !== 'string' || !call.name) {
+    throw invalidAnthropicRequest(`Anthropic tool call "${call.id}" requires a function name.`);
+  }
+  let input;
+  try {
+    input = JSON.parse(call.arguments ?? '{}');
+  } catch {
+    throw invalidAnthropicRequest(`Anthropic tool call "${call.id}" has malformed JSON arguments.`);
+  }
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw invalidAnthropicRequest(`Anthropic tool call "${call.id}" arguments must decode to an object.`);
+  }
+  content.push({ type: 'tool_use', id: call.id, name: call.name, input });
+  pendingCalls.set(call.id, { id: call.id, name: call.name, legacy: call.legacy });
+}
+
+function canonicalToolResult(message, pendingCalls, legacy) {
+  const explicitId = message.tool_call_id || message.call_id || message.id;
+  let call;
+  if (explicitId !== undefined) {
+    if (typeof explicitId !== 'string' || !explicitId) {
+      throw invalidAnthropicRequest('Anthropic tool results require a non-empty call ID.');
+    }
+    call = pendingCalls.get(explicitId);
+  } else if (legacy) {
+    const candidates = [...pendingCalls.values()].filter((candidate) => (
+      candidate.legacy && (typeof message.name !== 'string' || !message.name || candidate.name === message.name)
+    ));
+    if (candidates.length > 1) {
+      throw invalidAnthropicRequest('Anthropic legacy function result is ambiguous without a call ID.');
+    }
+    [call] = candidates;
+  }
+  if (!call) {
+    throw invalidAnthropicRequest('Anthropic tool result does not match a pending tool call.');
+  }
+  if (legacy && typeof message.name === 'string' && message.name && message.name !== call.name) {
+    throw invalidAnthropicRequest(`Anthropic function result name "${message.name}" does not match "${call.name}".`);
+  }
+  pendingCalls.delete(call.id);
+  const content = canonicalContent(message.content, {
+    role: 'tool result',
+    allowImages: true,
+    allowEmpty: true,
+  });
+  return {
+    type: 'tool_result',
+    tool_use_id: call.id,
+    content: content.length ? content : '',
+  };
+}
+
+function canonicalTools(tools, functions) {
+  if (tools !== undefined && !Array.isArray(tools)) {
+    throw invalidAnthropicRequest('Anthropic tools must be an array.');
+  }
+  if (functions !== undefined && !Array.isArray(functions)) {
+    throw invalidAnthropicRequest('Anthropic functions must be an array.');
+  }
+  const result = [];
+  const names = new Set();
+  for (const tool of tools || []) {
+    if (tool?.type !== 'function' || !tool.function || typeof tool.function !== 'object') {
+      throw invalidAnthropicRequest('Anthropic tools must contain OpenAI function definitions.');
+    }
+    result.push(canonicalTool(tool.function, names));
+  }
+  for (const fn of functions || []) result.push(canonicalTool(fn, names));
+  return result;
+}
+
+function canonicalTool(fn, names) {
+  if (!fn || typeof fn !== 'object' || Array.isArray(fn) || typeof fn.name !== 'string' || !fn.name) {
+    throw invalidAnthropicRequest('Anthropic function definitions require a name.');
+  }
+  if (names.has(fn.name)) {
+    throw invalidAnthropicRequest(`Anthropic function definition "${fn.name}" is duplicated.`);
+  }
+  if (!fn.parameters || typeof fn.parameters !== 'object' || Array.isArray(fn.parameters)) {
+    throw invalidAnthropicRequest(`Anthropic function definition "${fn.name}" requires a JSON Schema.`);
+  }
+  names.add(fn.name);
+  return {
+    name: fn.name,
+    ...(typeof fn.description === 'string' ? { description: fn.description } : {}),
+    input_schema: canonicalJsonSchema(fn.parameters),
+  };
+}
+
+function canonicalJsonSchema(schema) {
+  if (typeof schema === 'boolean') return schema;
+  const result = {};
+  for (const key of ['$ref', 'type', 'title', 'description', 'format', 'pattern', 'contentEncoding', 'contentMediaType']) {
+    if (typeof schema[key] === 'string') result[key] = schema[key];
+  }
+  if (Array.isArray(schema.type)) result.type = schema.type.filter((entry) => typeof entry === 'string');
+  for (const key of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf']) {
+    if (typeof schema[key] === 'number' && Number.isFinite(schema[key])) result[key] = schema[key];
+  }
+  for (const key of [
+    'minLength', 'maxLength', 'minItems', 'maxItems', 'minContains', 'maxContains',
+    'minProperties', 'maxProperties',
+  ]) {
+    if (Number.isInteger(schema[key]) && schema[key] >= 0) result[key] = schema[key];
+  }
+  for (const key of ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated']) {
+    if (typeof schema[key] === 'boolean') result[key] = schema[key];
+  }
+  for (const key of ['enum', 'examples']) {
+    if (Array.isArray(schema[key])) result[key] = structuredClone(schema[key]);
+  }
+  for (const key of ['const', 'default']) {
+    if (schema[key] !== undefined) result[key] = structuredClone(schema[key]);
+  }
+  if (Array.isArray(schema.required)) result.required = schema.required.filter((entry) => typeof entry === 'string');
+  for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
+    if (Array.isArray(schema[key])) result[key] = schema[key].map(canonicalJsonSchema);
+  }
+  for (const key of [
+    'not', 'if', 'then', 'else', 'items', 'contains', 'additionalProperties',
+    'unevaluatedProperties', 'propertyNames', 'unevaluatedItems',
+  ]) {
+    if (typeof schema[key] === 'boolean'
+      || (schema[key] && typeof schema[key] === 'object' && !Array.isArray(schema[key]))) {
+      result[key] = canonicalJsonSchema(schema[key]);
+    }
+  }
+  for (const key of ['properties', 'patternProperties', '$defs', 'dependentSchemas']) {
+    if (schema[key] && typeof schema[key] === 'object' && !Array.isArray(schema[key])) {
+      result[key] = Object.fromEntries(
+        Object.entries(schema[key]).map(([name, value]) => [name, canonicalJsonSchema(value)]),
+      );
+    }
+  }
+  if (schema.dependentRequired && typeof schema.dependentRequired === 'object'
+    && !Array.isArray(schema.dependentRequired)) {
+    result.dependentRequired = Object.fromEntries(
+      Object.entries(schema.dependentRequired)
+        .filter(([, value]) => Array.isArray(value))
+        .map(([name, value]) => [name, value.filter((entry) => typeof entry === 'string')]),
+    );
+  }
+  return result;
+}
+
+function canonicalToolChoice(choice, tools) {
+  if (choice === undefined) return undefined;
+  if (choice === 'auto') return { type: 'auto' };
+  if (choice === 'required') {
+    if (!tools.length) {
+      throw invalidAnthropicRequest('Anthropic required tool choice requires at least one function definition.');
+    }
+    return { type: 'any' };
+  }
+  if (choice === 'none') {
+    throw invalidAnthropicRequest('Anthropic tool choice does not support "none".');
+  }
+  if (choice?.type === 'function') {
+    const name = choice.function?.name || choice.name;
+    if (typeof name !== 'string' || !name) {
+      throw invalidAnthropicRequest('Anthropic function tool choice requires a function name.');
+    }
+    if (!tools.some((tool) => tool.name === name)) {
+      throw invalidAnthropicRequest(`Anthropic tool choice names undefined function "${name}".`);
+    }
+    return { type: 'tool', name };
+  }
+  throw invalidAnthropicRequest('Anthropic tool choice must be auto, required, or one named function.');
+}
+
+function canonicalMaxTokens(payload, route) {
+  const requested = payload.max_tokens ?? payload.max_completion_tokens ?? payload.max_output_tokens;
+  if (requested !== undefined && (!Number.isInteger(requested) || requested <= 0)) {
+    throw invalidAnthropicRequest('Anthropic max tokens must be a positive integer.');
+  }
+  const configured = route.model.maxOutputTokens;
+  if (configured !== undefined && (!Number.isInteger(configured) || configured <= 0)) {
+    throw invalidAnthropicRequest('Anthropic configured max output tokens must be a positive integer.');
+  }
+  return Math.min(requested ?? configured ?? 4096, configured ?? Number.MAX_SAFE_INTEGER);
+}
+
+function invalidAnthropicRequest(message) {
+  return new AdapterEventError(message, {
+    category: 'invalid-request',
+    status: 400,
+    retryable: false,
+  });
 }
 
 function translateSse(source, res, onEvent) {
