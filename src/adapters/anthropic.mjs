@@ -380,6 +380,9 @@ function canonicalTool(fn, names) {
   if (!fn || typeof fn !== 'object' || Array.isArray(fn) || typeof fn.name !== 'string' || !fn.name) {
     throw invalidAnthropicRequest('Anthropic function definitions require a name.');
   }
+  if (fn.description !== undefined && typeof fn.description !== 'string') {
+    throw invalidAnthropicRequest(`Anthropic function definition "${fn.name}" description must be a string.`);
+  }
   if (names.has(fn.name)) {
     throw invalidAnthropicRequest(`Anthropic function definition "${fn.name}" is duplicated.`);
   }
@@ -427,6 +430,7 @@ function canonicalJsonSchema(schema) {
       if (typeof schema[key] !== 'string') {
         throw invalidAnthropicRequest(`Anthropic JSON Schema "${key}" must be a string.`);
       }
+      if (key === 'pattern') validateJsonSchemaPattern(schema[key], '"pattern"');
       result[key] = schema[key];
     }
   }
@@ -489,10 +493,9 @@ function canonicalJsonSchema(schema) {
   }
   if (schema.required !== undefined) {
     if (!Array.isArray(schema.required)
-      || !schema.required.length
       || schema.required.some((entry) => typeof entry !== 'string')
       || new Set(schema.required).size !== schema.required.length) {
-      throw invalidAnthropicRequest('Anthropic JSON Schema "required" must contain one or more unique strings.');
+      throw invalidAnthropicRequest('Anthropic JSON Schema "required" must contain unique strings.');
     }
     result.required = [...schema.required];
   }
@@ -508,7 +511,7 @@ function canonicalJsonSchema(schema) {
     }
   }
   for (const key of [
-    'not', 'if', 'then', 'else', 'items', 'contains', 'additionalItems', 'additionalProperties',
+    'not', 'if', 'then', 'else', 'contains', 'additionalItems', 'additionalProperties',
     'unevaluatedProperties', 'propertyNames', 'unevaluatedItems',
   ]) {
     if (schema[key] !== undefined) {
@@ -519,10 +522,23 @@ function canonicalJsonSchema(schema) {
       result[key] = canonicalJsonSchema(schema[key]);
     }
   }
+  if (schema.items !== undefined) {
+    if (Array.isArray(schema.items)) {
+      if (!schema.items.length) {
+        throw invalidAnthropicRequest('Anthropic JSON Schema tuple "items" must not be empty.');
+      }
+      result.items = schema.items.map(canonicalJsonSchema);
+    } else {
+      result.items = canonicalJsonSchema(schema.items);
+    }
+  }
   for (const key of ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']) {
     if (schema[key] !== undefined) {
       if (!schema[key] || typeof schema[key] !== 'object' || Array.isArray(schema[key])) {
         throw invalidAnthropicRequest(`Anthropic JSON Schema "${key}" must be an object.`);
+      }
+      if (key === 'patternProperties') {
+        for (const pattern of Object.keys(schema[key])) validateJsonSchemaPattern(pattern, '"patternProperties" name');
       }
       result[key] = Object.fromEntries(
         Object.entries(schema[key]).map(([name, value]) => [name, canonicalJsonSchema(value)]),
@@ -534,11 +550,10 @@ function canonicalJsonSchema(schema) {
       || Array.isArray(schema.dependentRequired)
       || Object.values(schema.dependentRequired).some((value) => (
         !Array.isArray(value)
-        || !value.length
         || value.some((entry) => typeof entry !== 'string')
         || new Set(value).size !== value.length
       ))) {
-      throw invalidAnthropicRequest('Anthropic JSON Schema "dependentRequired" must map names to non-empty unique string arrays.');
+      throw invalidAnthropicRequest('Anthropic JSON Schema "dependentRequired" must map names to unique string arrays.');
     }
     result.dependentRequired = Object.fromEntries(
       Object.entries(schema.dependentRequired)
@@ -551,10 +566,9 @@ function canonicalJsonSchema(schema) {
     }
     result.dependencies = Object.fromEntries(Object.entries(schema.dependencies).map(([name, value]) => {
       if (Array.isArray(value)) {
-        if (!value.length
-          || value.some((entry) => typeof entry !== 'string')
+        if (value.some((entry) => typeof entry !== 'string')
           || new Set(value).size !== value.length) {
-          throw invalidAnthropicRequest('Anthropic JSON Schema property dependencies must contain one or more unique strings.');
+          throw invalidAnthropicRequest('Anthropic JSON Schema property dependencies must contain unique strings.');
         }
         return [name, [...value]];
       }
@@ -562,6 +576,14 @@ function canonicalJsonSchema(schema) {
     }));
   }
   return result;
+}
+
+function validateJsonSchemaPattern(pattern, location) {
+  try {
+    new RegExp(pattern);
+  } catch {
+    throw invalidAnthropicRequest(`Anthropic JSON Schema ${location} must be a valid regular expression.`);
+  }
 }
 
 function hasUniqueJsonValues(values) {

@@ -320,6 +320,42 @@ test('Anthropic adapter preserves schema dialect keywords and valid numeric and 
   });
 });
 
+test('Anthropic adapter preserves draft-07 tuple schemas and valid empty no-op arrays', async () => {
+  const { body } = await captureAnthropicRequest({
+    model: 'byok-anthropic-claude-test',
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'tuple',
+        description: 'Accept a tuple',
+        parameters: {
+          type: 'array',
+          items: [{ type: 'string', pattern: '^ok$' }, { type: 'integer' }],
+          additionalItems: false,
+          required: [],
+          dependencies: { legacy: [] },
+          dependentRequired: { modern: [] },
+          patternProperties: { '^x-': { type: 'string' } },
+        },
+      },
+    }],
+    messages: [{ role: 'user', content: 'Validate it' }],
+  });
+  assert.deepEqual(body.tools[0], {
+    name: 'tuple',
+    description: 'Accept a tuple',
+    input_schema: {
+      type: 'array',
+      items: [{ type: 'string', pattern: '^ok$' }, { type: 'integer' }],
+      additionalItems: false,
+      required: [],
+      dependencies: { legacy: [] },
+      dependentRequired: { modern: [] },
+      patternProperties: { '^x-': { type: 'string' } },
+    },
+  });
+});
+
 test('Anthropic adapter avoids generated legacy call ID collisions with later explicit calls', async () => {
   const { body } = await captureAnthropicRequest({
     model: 'byok-anthropic-claude-test',
@@ -391,6 +427,13 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
       tools: [{
         type: 'function',
         function: { name: 'go', parameters: { type: 'object', allOf: [] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['empty tuple items', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'array', items: [] } },
       }],
       messages: [{ role: 'user', content: 'go' }],
     }],
@@ -468,10 +511,9 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
       }],
       messages: [{ role: 'user', content: 'go' }],
     }],
-    ['empty required names', {
+    ['malformed schema pattern', {
       tools: [{
-        type: 'function',
-        function: { name: 'go', parameters: { type: 'object', required: [] } },
+        type: 'function', function: { name: 'go', parameters: { type: 'string', pattern: '[' } },
       }],
       messages: [{ role: 'user', content: 'go' }],
     }],
@@ -482,10 +524,16 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
       }],
       messages: [{ role: 'user', content: 'go' }],
     }],
-    ['empty property dependency names', {
+    ['malformed patternProperties name', {
+      tools: [{
+        type: 'function', function: { name: 'go', parameters: { patternProperties: { '[': { type: 'string' } } } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['non-string function description', {
       tools: [{
         type: 'function',
-        function: { name: 'go', parameters: { dependencies: { value: [] } } },
+        function: { name: 'go', description: 42, parameters: { type: 'object' } },
       }],
       messages: [{ role: 'user', content: 'go' }],
     }],
