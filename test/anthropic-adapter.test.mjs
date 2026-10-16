@@ -829,6 +829,7 @@ test('Anthropic adapter translates modern tools, results, schemas, and choices w
         private: true,
         parameters: {
           type: 'object',
+          'x-mcp-header': { private: true },
           properties: {
             'x-private-name': { type: 'string', private: true },
             nullable: { type: ['string', 'null'] },

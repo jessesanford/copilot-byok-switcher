@@ -509,7 +509,9 @@ function canonicalJsonSchema(schema) {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
     throw invalidAnthropicRequest('Anthropic JSON Schema entries must be objects or booleans.');
   }
-  const unknownKeyword = Object.keys(schema).find((key) => !JSON_SCHEMA_KEYWORDS.has(key));
+  const unknownKeyword = Object.keys(schema).find((key) => (
+    !JSON_SCHEMA_KEYWORDS.has(key) && !key.startsWith('x-')
+  ));
   if (unknownKeyword !== undefined) {
     throw invalidAnthropicRequest(`Anthropic JSON Schema keyword "${unknownKeyword}" is unsupported.`);
   }
