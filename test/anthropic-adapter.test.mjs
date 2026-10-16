@@ -283,6 +283,10 @@ test('Anthropic adapter preserves schema dialect keywords and valid numeric and 
           definitions: {
             positive: { type: 'number', exclusiveMinimum: 0, multipleOf: 0.5 },
           },
+          dependencies: {
+            value: ['unit'],
+            unit: { properties: { precision: { type: 'integer' } } },
+          },
           properties: {
             value: {
               allOf: [
@@ -300,6 +304,10 @@ test('Anthropic adapter preserves schema dialect keywords and valid numeric and 
     type: 'object',
     definitions: {
       positive: { type: 'number', exclusiveMinimum: 0, multipleOf: 0.5 },
+    },
+    dependencies: {
+      value: ['unit'],
+      unit: { properties: { precision: { type: 'integer' } } },
     },
     properties: {
       value: {
@@ -403,6 +411,100 @@ test('Anthropic adapter rejects malformed and unsupported request shapes without
         function: { name: 'go', parameters: { type: 'object', required: ['value', 1] } },
       }],
       messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['modern result for a legacy call', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_call_id: 'call_1',
+          function_call: { name: 'go', arguments: '{}' },
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+      ],
+    }],
+    ['legacy result for a modern call', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'go', arguments: '{}' } }],
+        },
+        { role: 'function', tool_call_id: 'call_1', name: 'go', content: 'done' },
+      ],
+    }],
+    ['invalid schema type name', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'record' } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['duplicate schema type name', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: ['string', 'string'] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['empty schema enum', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { enum: [] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['duplicate schema enum values', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { enum: ['same', 'same'] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['duplicate required names', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'object', required: ['value', 'value'] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['empty required names', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'object', required: [] } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['duplicate property dependency names', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { dependencies: { value: ['other', 'other'] } } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['empty property dependency names', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { dependencies: { value: [] } } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['unknown schema keyword', {
+      tools: [{
+        type: 'function',
+        function: { name: 'go', parameters: { type: 'object', unknownKeyword: true } },
+      }],
+      messages: [{ role: 'user', content: 'go' }],
+    }],
+    ['mixed legacy and modern assistant calls', {
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          function_call: { name: 'legacy', arguments: '{}' },
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'modern', arguments: '{}' } }],
+        },
+      ],
     }],
     ['ambiguous legacy result', {
       messages: [
