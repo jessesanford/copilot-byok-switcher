@@ -489,9 +489,70 @@ function toResponsesTool(tool) {
     name: fn.name,
     ...(typeof fn.description === 'string' ? { description: fn.description } : {}),
     ...(fn.parameters && typeof fn.parameters === 'object' && !Array.isArray(fn.parameters)
-      ? { parameters: fn.parameters } : {}),
+      ? { parameters: canonicalJsonSchema(fn.parameters) } : {}),
     ...(typeof fn.strict === 'boolean' ? { strict: fn.strict } : {}),
   };
+}
+
+function canonicalJsonSchema(schema) {
+  if (typeof schema === 'boolean') return schema;
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return {};
+
+  const result = {};
+  for (const key of ['$ref', 'type', 'title', 'description', 'format', 'pattern', 'contentEncoding', 'contentMediaType']) {
+    if (typeof schema[key] === 'string') result[key] = schema[key];
+  }
+  if (Array.isArray(schema.type)) {
+    result.type = schema.type.filter((entry) => typeof entry === 'string');
+  }
+  for (const key of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf']) {
+    if (typeof schema[key] === 'number' && Number.isFinite(schema[key])) result[key] = schema[key];
+  }
+  for (const key of [
+    'minLength', 'maxLength', 'minItems', 'maxItems', 'minContains', 'maxContains',
+    'minProperties', 'maxProperties',
+  ]) {
+    if (Number.isInteger(schema[key]) && schema[key] >= 0) result[key] = schema[key];
+  }
+  for (const key of ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated']) {
+    if (typeof schema[key] === 'boolean') result[key] = schema[key];
+  }
+  for (const key of ['enum', 'examples']) {
+    if (Array.isArray(schema[key])) result[key] = structuredClone(schema[key]);
+  }
+  for (const key of ['const', 'default']) {
+    if (schema[key] !== undefined) result[key] = structuredClone(schema[key]);
+  }
+  if (Array.isArray(schema.required)) {
+    result.required = schema.required.filter((entry) => typeof entry === 'string');
+  }
+  for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
+    if (Array.isArray(schema[key])) result[key] = schema[key].map(canonicalJsonSchema);
+  }
+  for (const key of [
+    'not', 'if', 'then', 'else', 'items', 'contains', 'additionalProperties',
+    'unevaluatedProperties', 'propertyNames', 'unevaluatedItems',
+  ]) {
+    if (typeof schema[key] === 'boolean' || (schema[key] && typeof schema[key] === 'object' && !Array.isArray(schema[key]))) {
+      result[key] = canonicalJsonSchema(schema[key]);
+    }
+  }
+  for (const key of ['properties', 'patternProperties', '$defs', 'dependentSchemas']) {
+    if (schema[key] && typeof schema[key] === 'object' && !Array.isArray(schema[key])) {
+      result[key] = Object.fromEntries(
+        Object.entries(schema[key]).map(([name, value]) => [name, canonicalJsonSchema(value)]),
+      );
+    }
+  }
+  if (schema.dependentRequired && typeof schema.dependentRequired === 'object'
+    && !Array.isArray(schema.dependentRequired)) {
+    result.dependentRequired = Object.fromEntries(
+      Object.entries(schema.dependentRequired)
+        .filter(([, value]) => Array.isArray(value))
+        .map(([name, value]) => [name, value.filter((entry) => typeof entry === 'string')]),
+    );
+  }
+  return result;
 }
 
 function toResponsesToolChoice(choice) {

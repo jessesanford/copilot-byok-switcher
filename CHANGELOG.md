@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-10-16
+
+### Fixed
+
+- Hardened the OpenAI Responses adapter boundary by rebuilding requests from
+  supported fields, including position-aware JSON Schema canonicalization for
+  function parameters, so Copilot-private metadata is never forwarded.
+- Preserved assistant tool-call history, parallel tool results, multimodal
+  content, and dense tool-call indexes when translating between Chat
+  Completions and Responses.
+- Made Responses stream completion deterministic: terminal events finish
+  immediately without waiting for socket closure, while provider failures,
+  malformed frames, invalid tool arguments, and truncated streams produce typed
+  downstream errors instead of silent success or hangs.
+
 ## [1.4.2] - 2026-08-12
 
 ### Changed

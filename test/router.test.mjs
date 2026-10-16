@@ -260,7 +260,24 @@ test('Responses requests rebuild the complete payload from supported fields only
           function: {
             name: 'lookup',
             description: 'Look up a value',
-            parameters: { type: 'object', properties: { id: { type: 'string' } } },
+            parameters: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', unknown_keyword: true },
+                __copilotMessageSource: { type: 'string', description: 'A legitimate property name' },
+                nested: {
+                  type: 'object',
+                  properties: { private: { type: 'boolean', private_keyword: true } },
+                  additionalProperties: false,
+                  __copilotMessageSource: 'local',
+                },
+              },
+              required: ['id', '__copilotMessageSource'],
+              additionalProperties: false,
+              $defs: { identifier: { type: 'string', unsupported: true } },
+              unknown_keyword: { nested: true },
+              __copilotMessageSource: 'local',
+            },
             strict: true,
             private: true,
           },
@@ -292,7 +309,21 @@ test('Responses requests rebuild the complete payload from supported fields only
         type: 'function',
         name: 'lookup',
         description: 'Look up a value',
-        parameters: { type: 'object', properties: { id: { type: 'string' } } },
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            __copilotMessageSource: { type: 'string', description: 'A legitimate property name' },
+            nested: {
+              type: 'object',
+              properties: { private: { type: 'boolean' } },
+              additionalProperties: false,
+            },
+          },
+          required: ['id', '__copilotMessageSource'],
+          additionalProperties: false,
+          $defs: { identifier: { type: 'string' } },
+        },
         strict: true,
       }],
       tool_choice: { type: 'function', name: 'lookup' },

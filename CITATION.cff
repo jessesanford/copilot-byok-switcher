@@ -5,5 +5,5 @@ authors:
   - family-names: Gasperini
     given-names: Michael
 url: "https://github.com/TheStreamCode/copilot-byok-switcher"
-version: "1.4.2"
+version: "1.4.3"
 license: MIT

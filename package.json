@@ -1,6 +1,6 @@
 {
   "name": "copilot-byok-switcher",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Add your own provider models to the GitHub Copilot CLI /model picker, in the same session as the GitHub ones, without storing credentials.",
   "keywords": [
     "github-copilot",
