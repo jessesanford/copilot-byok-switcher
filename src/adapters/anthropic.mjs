@@ -799,8 +799,8 @@ function emitAnthropicUsage(onEvent, accumulated, nativeUsage) {
   }
   if (!Object.keys(accumulated).length) return;
   const usage = { ...accumulated };
-  if (usage.outputTokens !== undefined) {
-    usage.totalTokens = (usage.inputTokens || 0)
+  if (usage.inputTokens !== undefined && usage.outputTokens !== undefined) {
+    usage.totalTokens = usage.inputTokens
       + (usage.cacheCreationInputTokens || 0)
       + (usage.cacheReadInputTokens || 0)
       + usage.outputTokens;

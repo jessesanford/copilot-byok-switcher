@@ -297,6 +297,23 @@ test('Anthropic adapter omits missing cache counters from usage snapshots', asyn
   ]);
 });
 
+test('Anthropic adapter does not invent totals for output-only usage', async () => {
+  const { events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start',
+      message: { id: 'msg_output_only', model: 'claude-test' },
+    }),
+    anthropicFrame('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 2 },
+    }),
+    anthropicFrame('message_stop', { type: 'message_stop' }),
+  ]);
+
+  assert.deepEqual(assembleAdapterEvents(events).usage, [{ outputTokens: 2 }]);
+});
+
 test('Anthropic adapter maps max-token and unknown terminal reasons predictably', async () => {
   for (const [stopReason, chatReason, normalizedReason] of [
     ['max_tokens', 'length', 'length'],
