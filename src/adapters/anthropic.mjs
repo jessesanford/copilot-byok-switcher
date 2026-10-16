@@ -38,7 +38,7 @@ export function createAnthropicAdapter({ providerIdleTimeoutMs }) {
   });
 }
 
-function forwardAnthropic({ res, payload, route, onEvent, providerIdleTimeoutMs, signal }) {
+function forwardAnthropic({ req, res, payload, route, onEvent, providerIdleTimeoutMs, signal }) {
   const { provider, model } = route;
   const target = new URL(`${provider.baseUrl.replace(/\/$/, '')}/messages`);
   const client = target.protocol === 'https:' ? https : http;
@@ -65,7 +65,19 @@ function forwardAnthropic({ res, payload, route, onEvent, providerIdleTimeoutMs,
     headers[route.authPolicy.header || 'x-api-key'] = provider.apiKey;
   }
 
-  onEvent({ type: 'route', provider: provider.id, model: model.model, adapter: 'anthropic' });
+  onEvent({
+    type: 'route',
+    provider: provider.id,
+    model: model.model,
+    adapter: 'anthropic',
+    inboundPath: req.url,
+    outboundPath: target.pathname,
+    messageCount: payload.messages?.length ?? 0,
+    toolCount: payload.tools?.length ?? payload.functions?.length ?? 0,
+    roles: Array.isArray(payload.messages)
+      ? payload.messages.map(({ role }) => role).filter((role) => typeof role === 'string')
+      : [],
+  });
   const providerReq = client.request({ signal,
     hostname: target.hostname,
     port: target.port || (target.protocol === 'https:' ? 443 : 80),

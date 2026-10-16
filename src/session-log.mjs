@@ -62,7 +62,12 @@ export function createSessionLog(io) {
         // Something adapted rather than failed: worth recording, not worth alarming.
         write(`notice: ${event.provider ? `${event.provider}: ` : ''}${event.message}`);
       } else if (event.type === 'route') {
-        write(`route: ${event.provider} -> ${event.model}`);
+        const shape = event.adapter
+          ? ` via ${event.adapter} ${event.inboundPath || '?'} -> ${event.outboundPath || '?'}`
+            + ` messages=${event.messageCount ?? '?'} tools=${event.toolCount ?? '?'}`
+            + (event.roles?.length ? ` roles=${event.roles.join(',')}` : '')
+          : '';
+        write(`route: ${event.provider} -> ${event.model}${shape}`);
       } else if (event.type === 'models') {
         write(`models: upstream ${event.status}, ${event.injected} BYOK entries added`);
       }
