@@ -217,6 +217,182 @@ test('Responses requests translate prior assistant tool calls into function call
   }
 });
 
+test('Responses requests rebuild the complete payload from supported fields only', async () => {
+  let received;
+  const provider = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'response-allowlist', output: [] }));
+    });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-allowlist', name: 'Responses allowlist',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-allowlist', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-allowlist-gpt-6-allowlist',
+        stream: false,
+        messages: [
+          { role: 'system', content: 'Be concise.', __copilotMessageSource: 'local', unknown: true },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Describe this', unknown: true },
+              { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==', detail: 'low', unknown: true } },
+              { type: 'private_part', secret: true },
+            ],
+            __copilotMessageSource: 'local',
+          },
+          { role: 'assistant', content: null, refusal: 'Unable', private: { nested: true } },
+        ],
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'lookup',
+            description: 'Look up a value',
+            parameters: { type: 'object', properties: { id: { type: 'string' } } },
+            strict: true,
+            private: true,
+          },
+          __copilotMessageSource: 'local',
+        }],
+        tool_choice: { type: 'function', function: { name: 'lookup', private: true }, private: true },
+        parallel_tool_calls: true,
+        max_tokens: 42,
+        __copilotMessageSource: 'local',
+        unknown_top_level: { nested: true },
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(received, {
+      model: 'gpt-6-allowlist',
+      input: [
+        { role: 'system', content: [{ type: 'input_text', text: 'Be concise.' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'Describe this' },
+            { type: 'input_image', image_url: 'data:image/png;base64,AA==', detail: 'low' },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'refusal', refusal: 'Unable' }] },
+      ],
+      stream: false,
+      tools: [{
+        type: 'function',
+        name: 'lookup',
+        description: 'Look up a value',
+        parameters: { type: 'object', properties: { id: { type: 'string' } } },
+        strict: true,
+      }],
+      tool_choice: { type: 'function', name: 'lookup' },
+      parallel_tool_calls: true,
+      max_output_tokens: 42,
+    });
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses requests preserve ordered parallel tool history and outputs', async () => {
+  let received;
+  const provider = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-parallel', name: 'Responses parallel',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-parallel', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-parallel-gpt-6-parallel',
+        messages: [
+          { role: 'assistant', content: 'Checking', tool_calls: [
+            { id: 'call_a', type: 'function', function: { name: 'first', arguments: { value: 1 } } },
+            { id: 'call_b', type: 'function', function: { name: 'second', arguments: '{"value":2}' } },
+          ] },
+          { role: 'tool', tool_call_id: 'call_a', content: [{ type: 'text', text: 'one' }] },
+          { role: 'tool', tool_call_id: 'call_b', content: 'two' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(received.input, [
+      { role: 'assistant', content: [{ type: 'output_text', text: 'Checking' }] },
+      { type: 'function_call', call_id: 'call_a', name: 'first', arguments: '{"value":1}' },
+      { type: 'function_call', call_id: 'call_b', name: 'second', arguments: '{"value":2}' },
+      { type: 'function_call_output', call_id: 'call_a', output: 'one' },
+      { type: 'function_call_output', call_id: 'call_b', output: 'two' },
+    ]);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('malformed Responses tool history fails locally with a typed error', async () => {
+  let providerRequests = 0;
+  const provider = http.createServer((_req, res) => {
+    providerRequests += 1;
+    res.writeHead(500).end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const events = [];
+  const catalog = buildCatalog([{
+    id: 'responses-invalid', name: 'Responses invalid',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-invalid', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    onEvent: (event) => events.push(event),
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-invalid-gpt-6-invalid',
+        messages: [{ role: 'assistant', tool_calls: [{ id: 'call_missing_name', function: { arguments: '{}' } }] }],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error.message, /function name/);
+    assert.equal(providerRequests, 0);
+    assert.equal(events.at(-1).error.category, 'invalid-request');
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses tool-call streams translate function calls to Chat tool-call chunks', async () => {
   const frames = [
     'data: {"type":"response.output_item.added","response":{"id":"resp-tool"},"item":{"type":"function_call","call_id":"call_1","name":"date","arguments":""}}\n\n',
@@ -252,6 +428,59 @@ test('Responses tool-call streams translate function calls to Chat tool-call chu
   }
 });
 
+test('Responses parallel tool streams emit each fragment once and one terminal completion', async () => {
+  const frames = [
+    'data: {"type":"response.output_item.added","response":{"id":"resp-parallel"},"output_index":0,"item":{"id":"item_a","type":"function_call","call_id":"call_a","name":"first","arguments":""}}\n\n',
+    'data: {"type":"response.output_item.added","response":{"id":"resp-parallel"},"output_index":1,"item":{"id":"item_b","type":"function_call","call_id":"call_b","name":"second","arguments":""}}\n\n',
+    'data: {"type":"response.function_call_arguments.delta","response":{"id":"resp-parallel"},"item_id":"item_a","delta":"{\\"a\\":"}\n\n',
+    'data: {"type":"response.function_call_arguments.done","response":{"id":"resp-parallel"},"item_id":"item_a","arguments":"{\\"a\\":1}"}\n\n',
+    'data: {"type":"response.function_call_arguments.done","response":{"id":"resp-parallel"},"item_id":"item_b","arguments":"{\\"b\\":2}"}\n\n',
+    'data: {"type":"response.output_item.done","response":{"id":"resp-parallel"},"output_index":0,"item":{"id":"item_a","type":"function_call","name":"first","arguments":"{\\"a\\":1}"}}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp-parallel"}}\n\n',
+    'data: {"type":"response.done","response":{"id":"resp-parallel"}}\n\n',
+  ];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of frames) res.write(frame);
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-parallel-stream', name: 'Responses parallel stream',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-parallel-stream', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-parallel-stream-gpt-6-parallel-stream', stream: true, messages: [] }),
+    });
+    const text = await response.text();
+    const chunks = text.split('\n\n').filter((frame) => frame.startsWith('data: {'))
+      .map((frame) => JSON.parse(frame.slice(6)));
+    const toolDeltas = chunks.flatMap((chunk) => chunk.choices[0].delta.tool_calls || []);
+    assert.deepEqual(toolDeltas.map(({ index, id, function: fn }) => ({
+      index,
+      ...(id === undefined ? {} : { id }),
+      ...fn,
+    })), [
+      { index: 0, id: 'call_a', name: 'first', arguments: '' },
+      { index: 1, id: 'call_b', name: 'second', arguments: '' },
+      { index: 0, arguments: '{"a":' },
+      { index: 0, arguments: '1}' },
+      { index: 1, arguments: '{"b":2}' },
+    ]);
+    assert.equal(chunks.filter((chunk) => chunk.choices[0].finish_reason === 'tool_calls').length, 1);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses streams terminate with a Chat completion and close downstream', async () => {
   const frames = [
     'data: {"type":"response.output_text.delta","response":{"id":"resp-1"},"delta":"Today"}\n\n',
@@ -280,6 +509,39 @@ test('Responses streams terminate with a Chat completion and close downstream', 
   } finally {
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses terminal events close downstream before the provider socket closes', async () => {
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"response.output_text.delta","response":{"id":"resp-open"},"delta":"done"}\n\n');
+    res.write('data: {"type":"response.completed","response":{"id":"resp-open"}}\n\n');
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-open', name: 'Responses open',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-open', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-open-gpt-6-open', stream: true, messages: [] }),
+    });
+    const text = await Promise.race([
+      response.text(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('downstream waited for provider socket close')), 500)),
+    ]);
+    assert.match(text, /"content":"done"/);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    provider.closeAllConnections();
     await new Promise((resolve) => provider.close(resolve));
   }
 });
