@@ -623,6 +623,132 @@ test('malformed Responses tool streams emit a typed downstream error', async () 
   }
 });
 
+test('Responses text completion is deduplicated per output and content item', async () => {
+  const frames = [
+    'data: {"type":"response.output_text.delta","response":{"id":"resp-text-items"},"output_index":0,"content_index":0,"delta":"first"}\n\n',
+    'data: {"type":"response.output_text.done","response":{"id":"resp-text-items"},"output_index":0,"content_index":0,"text":"first"}\n\n',
+    'data: {"type":"response.output_text.delta","response":{"id":"resp-text-items"},"output_index":1,"content_index":0,"delta":"second"}\n\n',
+    'data: {"type":"response.output_text.done","response":{"id":"resp-text-items"},"output_index":1,"content_index":0,"text":"second"}\n\n',
+    'data: {"type":"response.output_text.delta","response":{"id":"resp-text-items"},"output_index":1,"content_index":1,"delta":"third"}\n\n',
+    'data: {"type":"response.output_text.done","response":{"id":"resp-text-items"},"output_index":1,"content_index":1,"text":"third"}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp-text-items"}}\n\n',
+  ];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of frames) res.write(frame);
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-text-items', name: 'Responses text items',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-text-items', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-text-items-gpt-6-text-items', stream: true, messages: [] }),
+    });
+    const text = await response.text();
+    const content = text.split('\n\n').filter((frame) => frame.startsWith('data: {'))
+      .map((frame) => JSON.parse(frame.slice(6)))
+      .map((chunk) => chunk.choices?.[0]?.delta.content)
+      .filter((value) => value !== undefined);
+    assert.deepEqual(content, ['first', 'second', 'third']);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('malformed Responses SSE JSON fails closed with a typed downstream error', async () => {
+  const events = [];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"response.output_text.delta","delta":\n\n');
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-invalid-json', name: 'Responses invalid JSON',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-invalid-json', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    onEvent: (event) => events.push(event),
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-invalid-json-gpt-6-invalid-json', stream: true, messages: [] }),
+    });
+    const text = await response.text();
+    const errorFrame = text.split('\n\n').find((frame) => frame.startsWith('data: {"error"'));
+    assert.ok(errorFrame);
+    const error = JSON.parse(errorFrame.slice(6)).error;
+    assert.equal(error.category, 'malformed-response');
+    assert.match(error.message, /invalid JSON/i);
+    assert.doesNotMatch(text, /finish_reason/);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+    assert.equal(events.at(-1).error.category, 'malformed-response');
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses EOF before a terminal event is reported as truncated', async () => {
+  const events = [];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"response.output_text.delta","response":{"id":"resp-eof"},"delta":"partial"}\n\n');
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-eof', name: 'Responses EOF',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-eof', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({
+    catalog,
+    onEvent: (event) => events.push(event),
+    upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+  });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-eof-gpt-6-eof', stream: true, messages: [] }),
+    });
+    const text = await response.text();
+    assert.match(text, /"content":"partial"/);
+    const errorFrame = text.split('\n\n').find((frame) => frame.startsWith('data: {"error"'));
+    assert.ok(errorFrame);
+    const error = JSON.parse(errorFrame.slice(6)).error;
+    assert.equal(error.category, 'truncated');
+    assert.equal(error.retryable, true);
+    assert.match(error.message, /terminal event/i);
+    const chunks = text.split('\n\n').filter((frame) => frame.startsWith('data: {'))
+      .map((frame) => JSON.parse(frame.slice(6)));
+    assert.equal(chunks.some((chunk) => chunk.choices?.[0]?.finish_reason), false);
+    assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+    assert.equal(events.at(-1).error.category, 'truncated');
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses streams terminate with a Chat completion and close downstream', async () => {
   const frames = [
     'data: {"type":"response.output_text.delta","response":{"id":"resp-1"},"delta":"Today"}\n\n',

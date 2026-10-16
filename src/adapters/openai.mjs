@@ -131,7 +131,7 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   let buffer = '';
   let finished = false;
-  let emittedText = '';
+  const emittedText = new Map();
   const toolCalls = new Map();
   const toolAliases = new Map();
   const writeChunk = (id, delta, finishReason = null) => {
@@ -258,17 +258,25 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
         continue;
       }
       let event;
-      try { event = JSON.parse(data); } catch { continue; }
+      try {
+        event = JSON.parse(data);
+      } catch {
+        fail('The provider stream contained invalid JSON.');
+        continue;
+      }
       const id = event.response?.id || 'response';
       try {
         if (event.type === 'response.output_text.delta') {
           const text = typeof event.delta === 'string' ? event.delta : '';
-          emittedText += text;
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          emittedText.set(key, `${emittedText.get(key) || ''}${text}`);
           writeChunk(id, { content: text });
         } else if (event.type === 'response.output_text.done' && typeof event.text === 'string') {
-          const suffix = event.text.startsWith(emittedText) ? event.text.slice(emittedText.length) : event.text;
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          const previous = emittedText.get(key) || '';
+          const suffix = event.text.startsWith(previous) ? event.text.slice(previous.length) : event.text;
           if (suffix) {
-            emittedText += suffix;
+            emittedText.set(key, `${previous}${suffix}`);
             writeChunk(id, { content: suffix });
           }
         } else if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
@@ -307,7 +315,12 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
     }
   });
   source.on('end', () => {
-    if (!finished) finish();
+    if (!finished) {
+      fail(
+        'The provider stream ended before an explicit terminal event.',
+        { category: 'truncated', retryable: true },
+      );
+    }
   });
 }
 
