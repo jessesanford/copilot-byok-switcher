@@ -388,12 +388,15 @@ function toResponsesInput(messages) {
       continue;
     }
     if (message?.role === 'function') {
-      const matchingIndex = pendingLegacyCalls.findIndex((call) => (
-        typeof message.name !== 'string' || !message.name || call.name === message.name
-      ));
+      const explicitCallId = message.tool_call_id || message.call_id || message.id;
+      const matchingIndex = explicitCallId
+        ? pendingLegacyCalls.findIndex((call) => call.callId === explicitCallId)
+        : pendingLegacyCalls.findIndex((call) => (
+          typeof message.name !== 'string' || !message.name || call.name === message.name
+        ));
       const pending = matchingIndex === -1 ? undefined : pendingLegacyCalls.splice(matchingIndex, 1)[0];
       items.push(canonicalFunctionOutput({
-        call_id: message.tool_call_id || message.call_id || message.id || pending?.callId,
+        call_id: explicitCallId || pending?.callId,
         output: message.content,
       }));
       continue;

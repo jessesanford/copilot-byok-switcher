@@ -244,6 +244,10 @@ test('Responses requests translate legacy function results and boolean parameter
         messages: [
           { role: 'assistant', function_call: { name: 'lookup', arguments: '{"id":1}' } },
           { role: 'function', name: 'lookup', content: 'found' },
+          { role: 'assistant', function_call: { name: 'first', arguments: '{}' } },
+          { role: 'assistant', function_call: { name: 'second', arguments: '{}' } },
+          { role: 'function', call_id: 'call_3', content: 'second result' },
+          { role: 'function', call_id: 'call_2', content: 'first result' },
         ],
         tools: [{ type: 'function', function: { name: 'lookup', parameters: false } }],
       }),
@@ -252,6 +256,10 @@ test('Responses requests translate legacy function results and boolean parameter
     assert.deepEqual(received.input, [
       { type: 'function_call', call_id: 'call_0', name: 'lookup', arguments: '{"id":1}' },
       { type: 'function_call_output', call_id: 'call_0', output: 'found' },
+      { type: 'function_call', call_id: 'call_2', name: 'first', arguments: '{}' },
+      { type: 'function_call', call_id: 'call_3', name: 'second', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_3', output: 'second result' },
+      { type: 'function_call_output', call_id: 'call_2', output: 'first result' },
     ]);
     assert.deepEqual(received.tools, [{ type: 'function', name: 'lookup', parameters: false }]);
   } finally {
