@@ -274,6 +274,100 @@ test('Gemini adapter translates legacy functions and omits unused optional field
       }
 });
 
+test('Gemini adapter assembles ordered parallel function calls with stable identities', async () => {
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(frame({
+      candidates: [{
+        index: 0,
+        content: {
+          parts: [
+            { text: 'Checking ' },
+            { functionCall: { name: 'weather', args: { city: 'Berlin' } } },
+            { functionCall: { name: 'clock', args: { zone: 'Europe/Berlin' } } },
+          ],
+        },
+      }],
+    }));
+    res.write(frame({
+      candidates: [{
+        index: 0,
+        content: {
+          parts: [
+            { text: '' },
+            { functionCall: { name: 'weather', args: { city: 'Berlin' } } },
+            { functionCall: { name: 'clock', args: { zone: 'Europe/Berlin' } } },
+          ],
+        },
+        finishReason: 'STOP',
+      }],
+    }));
+    res.end();
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-sdc-gemini-picker',
+        stream: true,
+        messages: [{ role: 'user', content: 'Use both.' }],
+        tools: [
+          { type: 'function', function: { name: 'weather', parameters: { type: 'object' } } },
+          { type: 'function', function: { name: 'clock', parameters: { type: 'object' } } },
+        ],
+      }),
+    });
+    const stream = await response.text();
+    const assembled = assembleAdapterEvents(events.filter(isAdapterEvent));
+
+    assert.equal(response.status, 200);
+    assert.equal(assembled.text, 'Checking ');
+    assert.deepEqual(assembled.tools, [
+      {
+        id: 'gemini-call-0-1',
+        index: 1,
+        name: 'weather',
+        arguments: '{"city":"Berlin"}',
+        complete: true,
+      },
+      {
+        id: 'gemini-call-0-2',
+        index: 2,
+        name: 'clock',
+        arguments: '{"zone":"Europe/Berlin"}',
+        complete: true,
+      },
+    ]);
+    assert.deepEqual(assembled.finishes, ['tool-calls']);
+    assert.deepEqual(clientToolCalls(stream), [
+      {
+        index: 1,
+        id: 'gemini-call-0-1',
+        name: 'weather',
+        arguments: '{"city":"Berlin"}',
+      },
+      {
+        index: 2,
+        id: 'gemini-call-0-2',
+        name: 'clock',
+        arguments: '{"zone":"Europe/Berlin"}',
+      },
+    ]);
+    assert.match(stream, /"finish_reason":"tool_calls"/);
+    assert.equal(doneCount(stream), 1);
+  } finally {
+    await router.shutdown();
+    provider.closeAllConnections();
+    await close(provider);
+  }
+});
+
 function makeRouter(provider, events) {
   return createRouter({
     catalog: buildCatalog([{
@@ -305,8 +399,27 @@ function doneCount(stream) {
   return stream.match(/data: \[DONE\]/g)?.length || 0;
 }
 
+function clientToolCalls(stream) {
+  const calls = new Map();
+  for (const payload of parseChunks(stream)) {
+    for (const call of payload.choices[0].delta.tool_calls || []) {
+      const current = calls.get(call.index) || {
+        index: call.index,
+        id: '',
+        name: '',
+        arguments: '',
+      };
+      if (call.id) current.id += call.id;
+      if (call.function?.name) current.name += call.function.name;
+      if (call.function?.arguments) current.arguments += call.function.arguments;
+      calls.set(call.index, current);
+    }
+  }
+  return [...calls.values()].sort((left, right) => left.index - right.index);
+}
+
 function isAdapterEvent(event) {
-  return ['text', 'finish', 'error'].includes(event.type);
+  return ['text', 'tool-fragment', 'tool', 'finish', 'error'].includes(event.type);
 }
 
 function listen(server) {

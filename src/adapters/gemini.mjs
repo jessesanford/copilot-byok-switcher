@@ -73,7 +73,6 @@ function forwardGemini({ res, payload, route, onEvent, providerIdleTimeoutMs, si
       return;
     }
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-    writeChunk(res, streamId, route.wireModel, { role: 'assistant' });
     translateSse(
       providerRes,
       res,
@@ -81,6 +80,7 @@ function forwardGemini({ res, payload, route, onEvent, providerIdleTimeoutMs, si
       lifecycle,
       streamId,
       route.wireModel,
+      outbound.generationConfig?.candidateCount || 1,
     );
   });
   lifecycle.setRequest(providerReq);
@@ -385,8 +385,9 @@ function parseJsonObject(value, label) {
   return parsed;
 }
 
-function translateSse(source, res, onEvent, lifecycle, streamId, model) {
+function translateSse(source, res, onEvent, lifecycle, streamId, model, expectedCandidates) {
   let buffer = '';
+  const state = { candidates: new Map(), expectedCandidates };
   source.setEncoding('utf8');
   source.on('data', (chunk) => {
     if (lifecycle.terminal) return;
@@ -397,7 +398,7 @@ function translateSse(source, res, onEvent, lifecycle, streamId, model) {
       if (lifecycle.terminal) break;
       try {
         const value = parseGeminiFrame(frame);
-        handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model);
+        handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model, state);
       } catch (error) {
         lifecycle.fail(new AdapterEventError(error.message, {
           category: 'malformed-response',
@@ -446,36 +447,119 @@ function parseGeminiFrame(frame) {
   return value;
 }
 
-function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model) {
-  if (!Array.isArray(value.candidates) || value.candidates.length !== 1) {
+function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model, state) {
+  if (!Array.isArray(value.candidates) || !value.candidates.length) {
     throw new Error('The Gemini provider stream contained an invalid candidate response.');
   }
-  const [candidate] = value.candidates;
-  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
-    throw new Error('The Gemini provider stream contained an invalid candidate response.');
-  }
-  const parts = candidate.content?.parts;
-  if (parts !== undefined) {
-    if (!Array.isArray(parts)) {
-      throw new Error('The Gemini provider stream contained invalid content parts.');
+  for (const [position, candidate] of value.candidates.entries()) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new Error('The Gemini provider stream contained an invalid candidate response.');
     }
-    for (const part of parts) {
-      if (!part || typeof part !== 'object' || Array.isArray(part) || typeof part.text !== 'string') {
-        throw new Error('The Gemini provider stream contained a non-text content part.');
+    const candidateIndex = candidate.index === undefined ? position : candidate.index;
+    if (!Number.isInteger(candidateIndex) || candidateIndex < 0) {
+      throw new Error('The Gemini provider stream contained an invalid candidate index.');
+    }
+    const candidateState = geminiCandidateState(state, candidateIndex, res, streamId, model);
+    const parts = candidate.content?.parts;
+    if (parts !== undefined) {
+      if (!Array.isArray(parts)) {
+        throw new Error('The Gemini provider stream contained invalid content parts.');
       }
-      if (!part.text) continue;
-      onEvent({ type: 'text', text: part.text });
-      writeChunk(res, streamId, model, { content: part.text });
+      for (const [partIndex, part] of parts.entries()) {
+        handleGeminiPart(part, partIndex, candidateIndex, candidateState, res, onEvent, streamId, model);
+      }
+    }
+    if (candidate.finishReason !== undefined) {
+      if (candidate.finishReason !== 'STOP') {
+        throw new Error('The Gemini provider stream contained an unsupported finish reason.');
+      }
+      const mapping = candidateState.hasTools
+        ? { chat: 'tool_calls', normalized: 'tool-calls' }
+        : { chat: 'stop', normalized: 'stop' };
+      onEvent({ type: 'finish', reason: mapping.normalized });
+      writeChunk(res, streamId, model, candidateIndex, {}, mapping.chat);
+      candidateState.finished = true;
     }
   }
-  if (candidate.finishReason !== undefined) {
-    if (candidate.finishReason !== 'STOP') {
-      throw new Error('The Gemini provider stream contained an unsupported finish reason.');
-    }
-    onEvent({ type: 'finish', reason: 'stop' });
-    writeChunk(res, streamId, model, {}, 'stop');
+  if ([...state.candidates.values()].filter(({ finished }) => finished).length === state.expectedCandidates) {
     lifecycle.complete();
   }
+}
+
+function geminiCandidateState(state, index, res, streamId, model) {
+  let candidate = state.candidates.get(index);
+  if (!candidate) {
+    candidate = { calls: new Map(), finished: false, hasTools: false };
+    state.candidates.set(index, candidate);
+    writeChunk(res, streamId, model, index, { role: 'assistant' });
+  }
+  if (candidate.finished) {
+    throw new Error('The Gemini provider stream emitted data after a candidate finished.');
+  }
+  return candidate;
+}
+
+function handleGeminiPart(part, partIndex, candidateIndex, state, res, onEvent, streamId, model) {
+  if (!part || typeof part !== 'object' || Array.isArray(part)) {
+    throw new Error('The Gemini provider stream contained an invalid content part.');
+  }
+  if (part.text !== undefined) {
+    if (typeof part.text !== 'string') {
+      throw new Error('The Gemini provider stream contained invalid text.');
+    }
+    if (!part.text) return;
+    onEvent({ type: 'text', text: part.text });
+    writeChunk(res, streamId, model, candidateIndex, { content: part.text });
+    return;
+  }
+  if (part.functionCall !== undefined) {
+    handleGeminiFunctionCall(
+      part.functionCall,
+      partIndex,
+      candidateIndex,
+      state,
+      res,
+      onEvent,
+      streamId,
+      model,
+    );
+    return;
+  }
+  throw new Error('The Gemini provider stream contained an unsupported content part.');
+}
+
+function handleGeminiFunctionCall(call, partIndex, candidateIndex, state, res, onEvent, streamId, model) {
+  if (!call || typeof call !== 'object' || Array.isArray(call)
+    || typeof call.name !== 'string' || !call.name
+    || !call.args || typeof call.args !== 'object' || Array.isArray(call.args)) {
+    throw new Error('The Gemini provider stream contained an invalid function call.');
+  }
+  const serialized = JSON.stringify(call.args);
+  const existing = state.calls.get(partIndex);
+  if (existing) {
+    if (existing.name !== call.name || existing.arguments !== serialized) {
+      throw new Error('The Gemini provider stream changed a function call after emission.');
+    }
+    return;
+  }
+  const id = `gemini-call-${candidateIndex}-${partIndex}`;
+  const identity = { id, index: partIndex, name: call.name, arguments: serialized };
+  state.calls.set(partIndex, identity);
+  state.hasTools = true;
+  onEvent({ type: 'tool-fragment', id, index: partIndex, name: call.name, arguments: '' });
+  onEvent({ type: 'tool-fragment', id, index: partIndex, arguments: serialized });
+  onEvent({ type: 'tool', ...identity });
+  writeChunk(res, streamId, model, candidateIndex, {
+    tool_calls: [{
+      index: partIndex,
+      id,
+      type: 'function',
+      function: { name: call.name, arguments: '' },
+    }],
+  });
+  writeChunk(res, streamId, model, candidateIndex, {
+    tool_calls: [{ index: partIndex, function: { arguments: serialized } }],
+  });
 }
 
 function createLifecycle({ res, onEvent, provider, signal }) {
@@ -565,13 +649,13 @@ function invalidGeminiRequest(message) {
   });
 }
 
-function writeChunk(res, id, model, delta, finishReason = null) {
+function writeChunk(res, id, model, index, delta, finishReason = null) {
   if (res.writableEnded || res.destroyed) return;
   res.write(`data: ${JSON.stringify({
     id,
     object: 'chat.completion.chunk',
     model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }],
+    choices: [{ index, delta, finish_reason: finishReason }],
   })}\n\n`);
 }
 
