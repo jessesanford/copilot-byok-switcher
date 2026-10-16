@@ -14,6 +14,7 @@ export const CONTRACT_CASES = Object.freeze([
 ]);
 export const OPENAI_CONTRACT_CASES = Object.freeze(['tracer', 'timeout', 'truncation', 'cancellation']);
 export const ANTHROPIC_CONTRACT_CASES = CONTRACT_CASES;
+export const GEMINI_CONTRACT_CASES = CONTRACT_CASES;
 
 const SECRET = 'contract-secret';
 const OBSERVATION_MS = 100;
@@ -31,7 +32,8 @@ export async function runContractCase(name, options = {}) {
 
 async function tracer(options = {}) {
   const anthropic = options.adapterKind === 'anthropic';
-  const frames = anthropic ? anthropicTracerFrames() : [
+  const gemini = options.adapterKind === 'gemini';
+  const frames = anthropic ? anthropicTracerFrames() : gemini ? geminiTracerFrames() : [
     'data: {"id":"chat-1","choices":[{"delta":{"content":"Checking "}}]}\n\n',
     'data: {"id":"chat-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\\"city\\":"}}]}}]}\n\n',
     'data: {"id":"chat-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"Berlin\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
@@ -74,6 +76,24 @@ async function tracer(options = {}) {
         stream: true,
         tools: [{ name: 'weather', input_schema: { type: 'object' } }],
       }, 'adapter contract tracer: expected translated request');
+    } else if (gemini) {
+      assert.match(stream, /"content":"Checking "/, 'adapter contract tracer: expected translated text');
+      assert.match(stream, /"name":"weather"/, 'adapter contract tracer: expected translated tool call');
+      assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1, 'adapter contract tracer: expected one terminal marker');
+      assert.equal(
+        received.path,
+        '/v1/models/trace-model:streamGenerateContent?alt=sse',
+        'adapter contract tracer: expected generate-content path',
+      );
+      assert.equal(
+        received.authorization,
+        ['Bearer', SECRET].join(' '),
+        'adapter contract tracer: expected exact bearer token',
+      );
+      assert.deepEqual(JSON.parse(received.body), {
+        contents: [{ role: 'user', parts: [{ text: 'Weather?' }] }],
+        tools: [{ functionDeclarations: [{ name: 'weather', parameters: { type: 'object' } }] }],
+      }, 'adapter contract tracer: expected translated request');
     } else {
       assert.equal(stream, frames.join(''), 'adapter contract tracer: expected exact SSE response bytes');
       assert.equal(received.path, '/v1/chat/completions', 'adapter contract tracer: expected chat-completions path');
@@ -99,7 +119,7 @@ async function providerError(options = {}) {
     provider,
     options,
     events,
-    request: anthropicRequest('byok-contract-provider-error-model'),
+    request: protocolRequest(options.adapterKind, 'byok-contract-provider-error-model'),
   });
   try {
     const body = await response.text();
@@ -122,7 +142,7 @@ async function malformed(options = {}) {
     provider,
     options,
     events,
-    request: anthropicRequest('byok-contract-malformed-model'),
+    request: protocolRequest(options.adapterKind, 'byok-contract-malformed-model'),
   });
   try {
     const body = await response.text();
@@ -139,9 +159,7 @@ async function timeout(options = {}) {
   const events = [];
   const timeoutMs = options.timeoutMs ?? 75;
   const provider = http.createServer(() => {});
-  const request = options.adapterKind === 'anthropic'
-    ? anthropicRequest('byok-contract-timeout-model')
-    : { model: 'byok-contract-timeout-model', messages: [] };
+  const request = protocolRequest(options.adapterKind, 'byok-contract-timeout-model');
   const { response, cleanup } = await start({ provider, options, timeoutMs, events, request });
   try {
     const body = await response.text();
@@ -176,14 +194,16 @@ async function truncation(options = {}) {
       res.write(anthropicFrame('content_block_delta', {
         type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' },
       }));
+    } else if (options.adapterKind === 'gemini') {
+      res.write(geminiFrame({
+        candidates: [{ index: 0, content: { parts: [{ text: 'partial' }] } }],
+      }));
     } else {
       res.write('data: partial');
     }
     setTimeout(() => res.socket.destroy(), 20);
   });
-  const request = options.adapterKind === 'anthropic'
-    ? anthropicRequest('byok-contract-truncated-model')
-    : { model: 'byok-contract-truncated-model', messages: [] };
+  const request = protocolRequest(options.adapterKind, 'byok-contract-truncated-model');
   const { response, cleanup } = await start({ provider, options, events, request });
   try {
     assert.match(await response.text(), /partial/, 'adapter contract truncation: expected partial stream');
@@ -207,12 +227,12 @@ async function cancellation(options = {}) {
       ? anthropicFrame('message_start', {
         type: 'message_start', message: { id: 'msg_cancel', model: 'cancelled' },
       })
-      : 'data: partial\n\n');
+      : options.adapterKind === 'gemini'
+        ? geminiFrame({ candidates: [{ index: 0, content: { parts: [{ text: 'partial' }] } }] })
+        : 'data: partial\n\n');
   });
   const events = [];
-  const request = options.adapterKind === 'anthropic'
-    ? anthropicRequest('byok-contract-cancel-model')
-    : { model: 'byok-contract-cancel-model', messages: [] };
+  const request = protocolRequest(options.adapterKind, 'byok-contract-cancel-model');
   const { router, cleanup } = await start({ provider, options, events, request, returnRouter: true });
   const client = http.request({
     hostname: '127.0.0.1',
@@ -258,6 +278,9 @@ async function start({ provider, options, request, events = [], timeoutMs = 300,
     baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
     apiKey: SECRET,
     adapterKind: options.adapterKind ?? 'openai',
+    ...(options.adapterKind === 'gemini'
+      ? { endpointFamily: 'generate-content', authPolicy: { type: 'bearer' } }
+      : {}),
     models: [{ model }],
   }]);
   const adapter = options.adapter ?? options.adapterFactory?.({ timeoutMs });
@@ -291,6 +314,14 @@ function anthropicRequest(model) {
   return { model, messages: [{ role: 'user', content: 'go' }] };
 }
 
+function protocolRequest(kind, model) {
+  if (kind === 'anthropic') return anthropicRequest(model);
+  if (kind === 'gemini') {
+    return { model, stream: true, messages: [{ role: 'user', content: 'go' }] };
+  }
+  return { model, messages: [] };
+}
+
 function anthropicTracerFrames() {
   return [
     anthropicFrame('message_start', {
@@ -321,6 +352,27 @@ function anthropicTracerFrames() {
     }, '\r\n'),
     anthropicFrame('message_stop', { type: 'message_stop' }, '\r\n'),
   ];
+}
+
+function geminiTracerFrames() {
+  return [
+    geminiFrame({
+      candidates: [{
+        index: 0,
+        content: {
+          parts: [
+            { text: 'Checking ' },
+            { functionCall: { name: 'weather', args: { city: 'Berlin' } } },
+          ],
+        },
+        finishReason: 'STOP',
+      }],
+    }),
+  ];
+}
+
+function geminiFrame(data) {
+  return `data: ${JSON.stringify(data)}\n\n`;
 }
 
 function anthropicFrame(event, data, newline = '\n') {

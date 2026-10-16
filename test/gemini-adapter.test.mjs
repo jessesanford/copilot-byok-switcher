@@ -499,6 +499,56 @@ test('Gemini adapter turns prompt-feedback-only and safety-blocked responses int
   }
 });
 
+test('Gemini adapter terminates once on a native error after partial output', async () => {
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(frame({
+      candidates: [{ index: 0, content: { parts: [{ text: 'partial' }] } }],
+    }));
+    res.write(frame({
+      error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'do not expose provider detail' },
+    }));
+    res.end(frame({
+      candidates: [{ index: 0, finishReason: 'STOP' }],
+    }));
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-sdc-gemini-picker',
+        stream: true,
+        messages: [{ role: 'user', content: 'Fail later.' }],
+      }),
+    });
+    const stream = await response.text();
+    const errors = events.filter(({ type }) => type === 'error');
+
+    assert.equal(response.status, 200);
+    assert.match(stream, /"content":"partial"/);
+    assert.equal(errors.length, 1);
+    assert.deepEqual(errors[0].error, {
+      category: 'rate-limit',
+      message: 'The Gemini provider rate limit was exceeded.',
+      retryable: true,
+      status: 429,
+    });
+    assert.doesNotMatch(stream, /do not expose provider detail/);
+    assert.equal(events.filter(({ type }) => type === 'finish').length, 0);
+    assert.equal(doneCount(stream), 1);
+  } finally {
+    await router.shutdown();
+    provider.closeAllConnections();
+    await close(provider);
+  }
+});
+
 function makeRouter(provider, events) {
   return createRouter({
     catalog: buildCatalog([{

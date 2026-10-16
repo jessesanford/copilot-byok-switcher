@@ -448,6 +448,10 @@ function parseGeminiFrame(frame) {
 }
 
 function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model, state) {
+  if (value.error !== undefined) {
+    lifecycle.fail(geminiStreamError(value.error));
+    return;
+  }
   emitGeminiUsage(value.usageMetadata, state, onEvent);
   if (value.promptFeedback !== undefined) {
     if (!value.promptFeedback || typeof value.promptFeedback !== 'object' || Array.isArray(value.promptFeedback)) {
@@ -755,6 +759,24 @@ function geminiHttpError(status = 502) {
       ? ['upstream', true, 'The Gemini provider failed to complete the request.']
       : ['upstream', false, 'The Gemini provider rejected the request.']);
   return new AdapterEventError(message, { category, status, retryable });
+}
+
+function geminiStreamError(error) {
+  if (!error || typeof error !== 'object' || Array.isArray(error)) {
+    return new AdapterEventError('The Gemini provider stream failed.', {
+      category: 'upstream',
+      retryable: false,
+    });
+  }
+  const status = Number.isInteger(error.code) && error.code >= 100 && error.code <= 599
+    ? error.code
+    : undefined;
+  if (status !== undefined) return geminiHttpError(status);
+  const retryable = ['UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'DEADLINE_EXCEEDED'].includes(error.status);
+  return new AdapterEventError('The Gemini provider stream failed.', {
+    category: error.status === 'RESOURCE_EXHAUSTED' ? 'rate-limit' : 'upstream',
+    retryable,
+  });
 }
 
 function invalidGeminiRequest(message) {
