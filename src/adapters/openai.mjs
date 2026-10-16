@@ -88,8 +88,9 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
       return;
     }
 
-    if (responses && providerRes.statusCode >= 200 && providerRes.statusCode < 300
-      && String(providerRes.headers['content-type'] || '').includes('text/event-stream')) {
+    const responsesStream = responses && providerRes.statusCode >= 200 && providerRes.statusCode < 300
+      && String(providerRes.headers['content-type'] || '').includes('text/event-stream');
+    if (responsesStream) {
       relayResponsesStream(providerRes, res, route.wireModel, {
         onEvent,
         provider: provider.id,
@@ -98,11 +99,13 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
       res.writeHead(providerRes.statusCode, providerRes.headers);
       providerRes.pipe(res);
     }
-    endOnBrokenSource(providerRes, res, (message) => {
-      if (signal?.aborted || res.destroyed || res.writableEnded) return;
-      const truncated = new AdapterEventError(message, { category: 'truncated', retryable: true });
-      onEvent({ type: 'error', provider: provider.id, message, error: truncated.toEvent().error });
-    });
+    if (!responsesStream) {
+      endOnBrokenSource(providerRes, res, (message) => {
+        if (signal?.aborted || res.destroyed || res.writableEnded) return;
+        const truncated = new AdapterEventError(message, { category: 'truncated', retryable: true });
+        onEvent({ type: 'error', provider: provider.id, message, error: truncated.toEvent().error });
+      });
+    }
   });
 
   let timedOut = false;
@@ -322,6 +325,18 @@ function relayResponsesStream(source, res, model, { onEvent, provider }) {
       );
     }
   });
+  source.on('error', () => {
+    fail(
+      'The provider response stream was interrupted.',
+      { category: 'truncated', retryable: true },
+    );
+  });
+  source.on('aborted', () => {
+    fail(
+      'The provider response stream was aborted by the remote end.',
+      { category: 'truncated', retryable: true },
+    );
+  });
 }
 
 function toResponsesPayload(payload, wireModel) {
@@ -354,25 +369,46 @@ function toResponsesPayload(payload, wireModel) {
 }
 
 function toResponsesInput(messages) {
-  return messages.flatMap((message, index) => {
-    if (message?.type === 'function_call') return canonicalFunctionCall(message, index);
-    if (message?.type === 'function_call_output') return canonicalFunctionOutput(message);
+  const items = [];
+  const pendingLegacyCalls = [];
+  for (const [index, message] of messages.entries()) {
+    if (message?.type === 'function_call') {
+      items.push(canonicalFunctionCall(message, index));
+      continue;
+    }
+    if (message?.type === 'function_call_output') {
+      items.push(canonicalFunctionOutput(message));
+      continue;
+    }
     if (message?.role === 'tool') {
-      return canonicalFunctionOutput({
+      items.push(canonicalFunctionOutput({
         call_id: message.tool_call_id,
         output: message.content,
-      });
+      }));
+      continue;
     }
-    if (!['system', 'developer', 'user', 'assistant'].includes(message?.role)) return [];
-    const items = [];
+    if (message?.role === 'function') {
+      const matchingIndex = pendingLegacyCalls.findIndex((call) => (
+        typeof message.name !== 'string' || !message.name || call.name === message.name
+      ));
+      const pending = matchingIndex === -1 ? undefined : pendingLegacyCalls.splice(matchingIndex, 1)[0];
+      items.push(canonicalFunctionOutput({
+        call_id: message.tool_call_id || message.call_id || message.id || pending?.callId,
+        output: message.content,
+      }));
+      continue;
+    }
+    if (!['system', 'developer', 'user', 'assistant'].includes(message?.role)) continue;
     const content = canonicalMessageContent(message.role, message.content, message.refusal);
     if (content.length) items.push({ role: message.role, content });
     if (message.role === 'assistant' && message.function_call != null) {
+      const callId = message.tool_call_id || message.call_id || message.id || `call_${index}`;
       items.push(canonicalFunctionCall({
-        call_id: message.tool_call_id || message.id || `call_${index}`,
+        call_id: callId,
         name: message.function_call.name,
         arguments: message.function_call.arguments,
       }, index));
+      pendingLegacyCalls.push({ callId, name: message.function_call.name });
     }
     if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
       for (const call of message.tool_calls) {
@@ -383,8 +419,8 @@ function toResponsesInput(messages) {
         }, index));
       }
     }
-    return items;
-  });
+  }
+  return items;
 }
 
 function canonicalMessageContent(role, content, refusal) {
@@ -488,7 +524,8 @@ function toResponsesTool(tool) {
     type: 'function',
     name: fn.name,
     ...(typeof fn.description === 'string' ? { description: fn.description } : {}),
-    ...(fn.parameters && typeof fn.parameters === 'object' && !Array.isArray(fn.parameters)
+    ...((typeof fn.parameters === 'boolean'
+      || (fn.parameters && typeof fn.parameters === 'object' && !Array.isArray(fn.parameters)))
       ? { parameters: canonicalJsonSchema(fn.parameters) } : {}),
     ...(typeof fn.strict === 'boolean' ? { strict: fn.strict } : {}),
   };

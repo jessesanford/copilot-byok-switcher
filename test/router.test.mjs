@@ -217,6 +217,50 @@ test('Responses requests translate prior assistant tool calls into function call
   }
 });
 
+test('Responses requests translate legacy function results and boolean parameter schemas', async () => {
+  let received;
+  const provider = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-legacy', name: 'Responses legacy',
+    baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-legacy', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-responses-legacy-gpt-6-legacy',
+        messages: [
+          { role: 'assistant', function_call: { name: 'lookup', arguments: '{"id":1}' } },
+          { role: 'function', name: 'lookup', content: 'found' },
+        ],
+        tools: [{ type: 'function', function: { name: 'lookup', parameters: false } }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(received.input, [
+      { type: 'function_call', call_id: 'call_0', name: 'lookup', arguments: '{"id":1}' },
+      { type: 'function_call_output', call_id: 'call_0', output: 'found' },
+    ]);
+    assert.deepEqual(received.tools, [{ type: 'function', name: 'lookup', parameters: false }]);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses requests rebuild the complete payload from supported fields only', async () => {
   let received;
   const provider = http.createServer((req, res) => {
@@ -777,6 +821,55 @@ test('Responses EOF before a terminal event is reported as truncated', async () 
     router.closeAllConnections();
     await new Promise((resolve) => router.close(resolve));
     await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test('Responses transport interruptions emit one typed downstream failure', async () => {
+  for (const scenario of [
+    { name: 'error', destroy: (res) => res.destroy(new Error('socket failed')) },
+    { name: 'aborted', destroy: (res) => res.destroy() },
+  ]) {
+    const events = [];
+    const provider = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('data: {"type":"response.output_text.delta","response":{"id":"resp-interrupted"},"delta":"partial"}\n\n');
+      setImmediate(() => scenario.destroy(res));
+    });
+    await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+    const catalog = buildCatalog([{
+      id: `responses-${scenario.name}`, name: `Responses ${scenario.name}`,
+      baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+      apiKey: 'k', models: [{ model: `gpt-6-${scenario.name}`, endpointFamily: 'responses' }],
+    }]);
+    const router = createRouter({
+      catalog,
+      onEvent: (event) => events.push(event),
+      upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }),
+    });
+    await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+    try {
+      const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: `byok-responses-${scenario.name}-gpt-6-${scenario.name}`,
+          stream: true,
+          messages: [],
+        }),
+      });
+      const text = await response.text();
+      const errorFrames = text.split('\n\n').filter((frame) => frame.startsWith('data: {"error"'));
+      assert.equal(errorFrames.length, 1, `${scenario.name} emits one downstream SSE error`);
+      const error = JSON.parse(errorFrames[0].slice(6)).error;
+      assert.equal(error.category, 'truncated');
+      assert.equal(error.retryable, true);
+      assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+      assert.equal(events.filter((event) => event.type === 'error').length, 1);
+      assert.equal(events.at(-1).error.category, 'truncated');
+    } finally {
+      router.closeAllConnections();
+      await new Promise((resolve) => router.close(resolve));
+      await new Promise((resolve) => provider.close(resolve));
+    }
   }
 });
 
