@@ -231,6 +231,59 @@ test('Anthropic adapter rejects message_stop while content blocks remain open', 
   }
 });
 
+test('Anthropic adapter validates terminal reasons and completed tool identities and arguments', async (t) => {
+  const messageStart = anthropicFrame('message_start', {
+    type: 'message_start', message: { id: 'msg_terminal_validation', model: 'claude-test' },
+  });
+  for (const [name, responseFrames, expectedMessage] of [
+    ['missing terminal stop reason', [
+      messageStart,
+      anthropicFrame('message_delta', { type: 'message_delta', delta: {} }),
+      anthropicFrame('message_stop', { type: 'message_stop' }),
+    ], 'The Anthropic provider stream contained an invalid terminal stop reason.'],
+    ['non-object completed tool arguments', [
+      messageStart,
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tool_array', name: 'lookup', input: {} },
+      }),
+      anthropicFrame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '[]' },
+      }),
+      anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    ], 'The Anthropic provider stream contained invalid tool arguments.'],
+    ['duplicate tool IDs across indexes', [
+      messageStart,
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tool_duplicate', name: 'first', input: {} },
+      }),
+      anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      anthropicFrame('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'tool_duplicate', name: 'second', input: {} },
+      }),
+    ], 'The Anthropic provider stream contained a duplicate tool ID.'],
+  ]) {
+    await t.test(name, async () => {
+      const { stream, events } = await relayAnthropicFrames(responseFrames);
+      const error = parseSsePayloads(stream).find((payload) => payload.error)?.error;
+      assert.deepEqual(error, {
+        category: 'malformed-response',
+        message: expectedMessage,
+        retryable: false,
+      });
+      assert.equal(events.filter((event) => event.type === 'finish').length, 0);
+      assert.equal(events.filter((event) => event.type === 'error').length, 1);
+    });
+  }
+});
+
 test('Anthropic adapter enforces the native message lifecycle', async (t) => {
   const messageStart = anthropicFrame('message_start', {
     type: 'message_start', message: { id: 'msg_lifecycle', model: 'claude-test' },

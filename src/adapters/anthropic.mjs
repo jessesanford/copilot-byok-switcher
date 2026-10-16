@@ -738,6 +738,7 @@ function translateSse(source, res, onEvent, lifecycle) {
     blocks: new Map(),
     seenBlocks: new Set(),
     tools: new Map(),
+    toolIds: new Set(),
     usage: {},
     stopReason: undefined,
     messageStarted: false,
@@ -842,6 +843,10 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name) {
       throw new Error('Anthropic tool blocks require an ID and function name.');
     }
+    if (state.toolIds.has(block.id)) {
+      throw new Error('The Anthropic provider stream contained a duplicate tool ID.');
+    }
+    state.toolIds.add(block.id);
     const tool = {
       id: block.id,
       index: value.index,
@@ -925,10 +930,14 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
       throw new Error('The Anthropic provider stream contained an invalid content block stop.');
     }
     if (tool) {
+      let argumentsValue;
       try {
-        JSON.parse(tool.arguments || '{}');
+        argumentsValue = JSON.parse(tool.arguments || '{}');
       } catch {
         throw new Error('The Anthropic provider stream contained malformed tool arguments.');
+      }
+      if (!argumentsValue || typeof argumentsValue !== 'object' || Array.isArray(argumentsValue)) {
+        throw new Error('The Anthropic provider stream contained invalid tool arguments.');
       }
       onEvent({ type: 'tool', ...tool });
       state.tools.delete(value.index);
@@ -943,8 +952,11 @@ function handleFrame(frame, res, onEvent, state, lifecycle) {
     }
     state.messageDeltaSeen = true;
     const stopReason = value.delta?.stop_reason;
+    if (typeof stopReason !== 'string' || !stopReason.trim()) {
+      throw new Error('The Anthropic provider stream contained an invalid terminal stop reason.');
+    }
     emitAnthropicUsage(onEvent, state.usage, value.usage);
-    if (stopReason) state.stopReason = stopReason;
+    state.stopReason = stopReason;
   } else if (event === 'error') {
     lifecycle.fail(anthropicStreamError(value.error));
   } else if (event === 'message_stop') {
