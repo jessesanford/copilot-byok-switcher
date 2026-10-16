@@ -128,10 +128,11 @@ function relayResponsesStream(source, res, model) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   let buffer = '';
   let finished = false;
+  const toolCalls = new Map();
   const finish = (id = 'response') => {
     if (finished) return;
     finished = true;
-    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: toolCalls.size ? 'tool_calls' : 'stop' }] })}\n\n`);
     res.end('data: [DONE]\n\n');
   };
   source.setEncoding('utf8');
@@ -152,6 +153,16 @@ function relayResponsesStream(source, res, model) {
       const id = event.response?.id || 'response';
       if (event.type === 'response.output_text.delta') {
         res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: event.delta || '' }, finish_reason: null }] })}\n\n`);
+      } else if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
+        const index = toolCalls.size;
+        const callId = event.item.call_id || event.item.id || `call_${index}`;
+        toolCalls.set(callId, index);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index, id: callId, type: 'function', function: { name: event.item.name || '', arguments: event.item.arguments || '' } }] }, finish_reason: null }] })}\n\n`);
+      } else if (event.type === 'response.function_call_arguments.delta') {
+        const callId = event.call_id || event.item_id;
+        const index = toolCalls.get(callId) ?? toolCalls.size;
+        if (!toolCalls.has(callId)) toolCalls.set(callId, index);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index, function: { arguments: event.delta || '' } }] }, finish_reason: null }] })}\n\n`);
       } else if (event.type === 'response.completed' || event.type === 'response.done') {
         finish(id);
       }

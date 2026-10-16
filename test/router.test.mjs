@@ -217,6 +217,41 @@ test('Responses requests translate prior assistant tool calls into function call
   }
 });
 
+test('Responses tool-call streams translate function calls to Chat tool-call chunks', async () => {
+  const frames = [
+    'data: {"type":"response.output_item.added","response":{"id":"resp-tool"},"item":{"type":"function_call","call_id":"call_1","name":"date","arguments":""}}\n\n',
+    'data: {"type":"response.function_call_arguments.delta","response":{"id":"resp-tool"},"call_id":"call_1","delta":"{}"}\n\n',
+    'data: {"type":"response.completed","response":{"id":"resp-tool"}}\n\n',
+  ];
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of frames) res.write(frame);
+    res.end();
+  });
+  await new Promise((resolve) => provider.listen(0, '127.0.0.1', resolve));
+  const catalog = buildCatalog([{
+    id: 'responses-tool-stream', name: 'Responses tool stream', baseUrl: `http://127.0.0.1:${provider.address().port}/v1`,
+    apiKey: 'k', models: [{ model: 'gpt-6-tool-stream', endpointFamily: 'responses' }],
+  }]);
+  const router = createRouter({ catalog, upstream: createUpstreamResolver({ explicit: 'https://upstream.invalid' }) });
+  await new Promise((resolve) => router.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'byok-responses-tool-stream-gpt-6-tool-stream', stream: true, messages: [{ role: 'user', content: 'date' }] }),
+    });
+    const text = await response.text();
+    assert.match(text, /"tool_calls":\[\{"index":0,"id":"call_1","type":"function"/);
+    assert.match(text, /"arguments":"\{\}"/);
+    assert.match(text, /finish_reason":"tool_calls"/);
+    assert.match(text, /data: \[DONE\]/);
+  } finally {
+    router.closeAllConnections();
+    await new Promise((resolve) => router.close(resolve));
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test('Responses streams terminate with a Chat completion and close downstream', async () => {
   const frames = [
     'data: {"type":"response.output_text.delta","response":{"id":"resp-1"},"delta":"Today"}\n\n',
