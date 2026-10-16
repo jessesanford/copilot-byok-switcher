@@ -200,6 +200,28 @@ test('Anthropic router acceptance: rich streams preserve parallel tools, hidden 
       { contentBlock: { index: 0, type: 'tool_use' } },
       { stopReason: 'tool_use' },
     ]);
+    assert.deepEqual(clientToolFragments(stream), [
+      {
+        index: 2,
+        id: 'tool_b',
+        type: 'function',
+        function: { name: 'second', arguments: '' },
+      },
+      { index: 2, function: { arguments: '{"city":"' } },
+      {
+        index: 0,
+        id: 'tool_a',
+        type: 'function',
+        function: { name: 'first', arguments: '' },
+      },
+      { index: 0, function: { arguments: '{"n":' } },
+      { index: 2, function: { arguments: 'Paris"}' } },
+      { index: 0, function: { arguments: '1}' } },
+    ]);
+    assert.deepEqual(assembleClientToolCalls(stream), [
+      { index: 0, id: 'tool_a', name: 'first', arguments: '{"n":1}' },
+      { index: 2, id: 'tool_b', name: 'second', arguments: '{"city":"Paris"}' },
+    ]);
     assert.match(stream, /"finish_reason":"tool_calls"/);
     assert.equal(doneCount(stream), 1);
     assert.doesNotMatch(stream, /private thought|hidden-signature|hidden-redacted-thinking/);
@@ -258,9 +280,17 @@ test('Anthropic router acceptance: HTTP and post-partial SSE failures are safe a
       });
       const stream = await response.text();
       const errors = harness.events.filter(({ type }) => type === 'error');
+      const downstreamErrors = parsePayloads(stream)
+        .filter((payload) => payload.error)
+        .map((payload) => payload.error);
       assert.match(stream, /"content":"partial"/);
       assert.equal(errors.length, 1);
       assert.equal(errors[0].error.category, 'upstream');
+      assert.deepEqual(downstreamErrors, [{
+        category: 'upstream',
+        message: 'The Anthropic provider stream failed.',
+        retryable: true,
+      }]);
       const finishReasons = parsePayloads(stream)
         .flatMap((payload) => payload.choices || [])
         .map((choice) => choice.finish_reason)
@@ -388,6 +418,29 @@ function parsePayloads(stream) {
   return stream.split(/\r?\n/)
     .filter((line) => line.startsWith('data: {'))
     .map((line) => JSON.parse(line.slice(6)));
+}
+
+function clientToolFragments(stream) {
+  return parsePayloads(stream)
+    .flatMap((payload) => payload.choices || [])
+    .flatMap((choice) => choice.delta?.tool_calls || []);
+}
+
+function assembleClientToolCalls(stream) {
+  const calls = new Map();
+  for (const fragment of clientToolFragments(stream)) {
+    const call = calls.get(fragment.index) || {
+      index: fragment.index,
+      id: '',
+      name: '',
+      arguments: '',
+    };
+    if (fragment.id) call.id = fragment.id;
+    if (fragment.function?.name) call.name += fragment.function.name;
+    if (fragment.function?.arguments) call.arguments += fragment.function.arguments;
+    calls.set(fragment.index, call);
+  }
+  return [...calls.values()].sort((left, right) => left.index - right.index);
 }
 
 function isAdapterEvent(event) {
