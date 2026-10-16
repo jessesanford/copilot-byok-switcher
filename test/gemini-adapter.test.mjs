@@ -52,6 +52,9 @@ test('Gemini adapter sends native SDC text requests and relays text through STOP
       { index: 0, delta: { content: 'Gemini' }, finish_reason: null },
       { index: 0, delta: {}, finish_reason: 'stop' },
     ]);
+    assert.ok(parseChunks(stream).every(({ id, model }) => (
+      typeof id === 'string' && id.startsWith('gemini-') && model === 'accounts/team/gemini-wire'
+    )));
     assert.equal(doneCount(stream), 1);
     const assembled = assembleAdapterEvents(events.filter(isAdapterEvent));
     assert.equal(assembled.text, 'Hello Gemini');
@@ -65,11 +68,13 @@ test('Gemini adapter sends native SDC text requests and relays text through STOP
 
 test('Gemini adapter rejects unsupported request shapes before provider traffic', async (t) => {
   const cases = [
-    ['multiple messages', { messages: [{ role: 'user', content: 'one' }, { role: 'user', content: 'two' }] }],
-    ['system messages', { messages: [{ role: 'system', content: 'rules' }, { role: 'user', content: 'go' }] }],
-    ['image content', { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] }] }],
-    ['tools', { messages: [{ role: 'user', content: 'go' }], tools: [] }],
-    ['settings', { messages: [{ role: 'user', content: 'go' }], temperature: 0 }],
+    ['missing stream', { messages: [{ role: 'user', content: 'go' }] }],
+    ['non-streaming', { stream: false, messages: [{ role: 'user', content: 'go' }] }],
+    ['multiple messages', { stream: true, messages: [{ role: 'user', content: 'one' }, { role: 'user', content: 'two' }] }],
+    ['system messages', { stream: true, messages: [{ role: 'system', content: 'rules' }, { role: 'user', content: 'go' }] }],
+    ['image content', { stream: true, messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] }] }],
+    ['tools', { stream: true, messages: [{ role: 'user', content: 'go' }], tools: [] }],
+    ['settings', { stream: true, messages: [{ role: 'user', content: 'go' }], temperature: 0 }],
   ];
 
   for (const [name, payload] of cases) {

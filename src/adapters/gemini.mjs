@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import { randomUUID } from 'node:crypto';
 
 import { AdapterEventError } from './events.mjs';
 
@@ -34,6 +35,7 @@ export function createGeminiAdapter({ providerIdleTimeoutMs }) {
 
 function forwardGemini({ res, payload, route, onEvent, providerIdleTimeoutMs, signal }) {
   const { provider, model } = route;
+  const streamId = `gemini-${randomUUID()}`;
   let outbound;
   let target;
   try {
@@ -80,8 +82,15 @@ function forwardGemini({ res, payload, route, onEvent, providerIdleTimeoutMs, si
       return;
     }
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-    writeChunk(res, { role: 'assistant' });
-    translateSse(providerRes, res, (event) => onEvent({ ...event, provider: provider.id }), lifecycle);
+    writeChunk(res, streamId, route.wireModel, { role: 'assistant' });
+    translateSse(
+      providerRes,
+      res,
+      (event) => onEvent({ ...event, provider: provider.id }),
+      lifecycle,
+      streamId,
+      route.wireModel,
+    );
   });
   lifecycle.setRequest(providerReq);
 
@@ -117,6 +126,9 @@ function geminiTarget(route) {
 }
 
 function toGeminiRequest(payload) {
+  if (payload.stream !== true) {
+    throw invalidGeminiRequest('Gemini text requests require streaming.');
+  }
   if (!Array.isArray(payload.messages) || payload.messages.length !== 1) {
     throw invalidGeminiRequest('Gemini text requests require exactly one user message.');
   }
@@ -139,7 +151,7 @@ function toGeminiRequest(payload) {
   };
 }
 
-function translateSse(source, res, onEvent, lifecycle) {
+function translateSse(source, res, onEvent, lifecycle, streamId, model) {
   let buffer = '';
   source.setEncoding('utf8');
   source.on('data', (chunk) => {
@@ -151,7 +163,7 @@ function translateSse(source, res, onEvent, lifecycle) {
       if (lifecycle.terminal) break;
       try {
         const value = parseGeminiFrame(frame);
-        handleGeminiResponse(value, res, onEvent, lifecycle);
+        handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model);
       } catch (error) {
         lifecycle.fail(new AdapterEventError(error.message, {
           category: 'malformed-response',
@@ -200,7 +212,7 @@ function parseGeminiFrame(frame) {
   return value;
 }
 
-function handleGeminiResponse(value, res, onEvent, lifecycle) {
+function handleGeminiResponse(value, res, onEvent, lifecycle, streamId, model) {
   if (!Array.isArray(value.candidates) || value.candidates.length !== 1) {
     throw new Error('The Gemini provider stream contained an invalid candidate response.');
   }
@@ -219,7 +231,7 @@ function handleGeminiResponse(value, res, onEvent, lifecycle) {
       }
       if (!part.text) continue;
       onEvent({ type: 'text', text: part.text });
-      writeChunk(res, { content: part.text });
+      writeChunk(res, streamId, model, { content: part.text });
     }
   }
   if (candidate.finishReason !== undefined) {
@@ -227,7 +239,7 @@ function handleGeminiResponse(value, res, onEvent, lifecycle) {
       throw new Error('The Gemini provider stream contained an unsupported finish reason.');
     }
     onEvent({ type: 'finish', reason: 'stop' });
-    writeChunk(res, {}, 'stop');
+    writeChunk(res, streamId, model, {}, 'stop');
     lifecycle.complete();
   }
 }
@@ -319,10 +331,12 @@ function invalidGeminiRequest(message) {
   });
 }
 
-function writeChunk(res, delta, finishReason = null) {
+function writeChunk(res, id, model, delta, finishReason = null) {
   if (res.writableEnded || res.destroyed) return;
   res.write(`data: ${JSON.stringify({
+    id,
     object: 'chat.completion.chunk',
+    model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
   })}\n\n`);
 }

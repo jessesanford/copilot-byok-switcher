@@ -46,6 +46,7 @@ test('Gemini router acceptance selects the registered adapter and exact wire mod
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'byok-sdc-gemini-picker',
+        stream: true,
         messages: [{ role: 'user', content: 'route me' }],
       }),
     });
@@ -68,6 +69,14 @@ test('Gemini router acceptance selects the registered adapter and exact wire mod
     });
     assert.equal(assembleAdapterEvents(events.filter(({ type }) => ['text', 'finish'].includes(type))).text, 'routed');
     assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+    const chunks = stream.split(/\r?\n/)
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice(6)));
+    assert.ok(chunks.every(({ id, model }) => (
+      typeof id === 'string'
+      && id.startsWith('gemini-')
+      && model === 'publishers/google/models/gemini-2.5-pro'
+    )));
   } finally {
     await router.shutdown();
     provider.closeAllConnections();
