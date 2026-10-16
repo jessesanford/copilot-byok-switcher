@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { buildCatalog } from '../src/catalog.mjs';
 import { loadConfig } from '../src/config.mjs';
+import { assembleAdapterEvents } from '../src/adapters/events.mjs';
 import { createRouter } from '../src/router.mjs';
 import { createUpstreamResolver } from '../src/upstream.mjs';
 
@@ -62,6 +63,149 @@ test('Anthropic adapter maps text requests and SSE deltas to Copilot-compatible 
     assert.match(stream, /data: \[DONE\]/);
     assert.deepEqual(events.filter((event) => event.type === 'text').map((event) => event.text), ['Hello ', 'world']);
   } finally { await close(router); await close(provider); }
+});
+
+test('Anthropic adapter assembles fragmented and interleaved native tool streams in provider order', async () => {
+  const toolFrames = [
+    anthropicFrame('message_start', { type: 'message_start', message: { id: 'msg_tools', model: 'claude-test' } }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 2,
+      content_block: { type: 'tool_use', id: 'tool_b', name: 'second', input: {} },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{"city":"' },
+    }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'tool_a', name: 'first', input: {} },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"n":' },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: 'Paris"}' },
+    }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 2 }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '1}' },
+    }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    anthropicFrame('message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' } }),
+    anthropicFrame('message_stop', { type: 'message_stop' }),
+  ];
+  const { stream, events } = await relayAnthropicFrames(toolFrames);
+  const chunks = parseChatChunks(stream);
+
+  assert.deepEqual(chunks.map((chunk) => chunk.choices[0]), [
+    { index: 0, delta: { role: 'assistant' }, finish_reason: null },
+    {
+      index: 0,
+      delta: {
+        tool_calls: [{
+          index: 2, id: 'tool_b', type: 'function', function: { name: 'second', arguments: '' },
+        }],
+      },
+      finish_reason: null,
+    },
+    {
+      index: 0,
+      delta: { tool_calls: [{ index: 2, function: { arguments: '{"city":"' } }] },
+      finish_reason: null,
+    },
+    {
+      index: 0,
+      delta: {
+        tool_calls: [{
+          index: 0, id: 'tool_a', type: 'function', function: { name: 'first', arguments: '' },
+        }],
+      },
+      finish_reason: null,
+    },
+    {
+      index: 0,
+      delta: { tool_calls: [{ index: 0, function: { arguments: '{"n":' } }] },
+      finish_reason: null,
+    },
+    {
+      index: 0,
+      delta: { tool_calls: [{ index: 2, function: { arguments: 'Paris"}' } }] },
+      finish_reason: null,
+    },
+    {
+      index: 0,
+      delta: { tool_calls: [{ index: 0, function: { arguments: '1}' } }] },
+      finish_reason: null,
+    },
+    { index: 0, delta: {}, finish_reason: 'tool_calls' },
+  ]);
+  assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+  assert.deepEqual(assembleAdapterEvents(events).tools, [
+    { id: 'tool_a', index: 0, name: 'first', arguments: '{"n":1}', complete: true },
+    { id: 'tool_b', index: 2, name: 'second', arguments: '{"city":"Paris"}', complete: true },
+  ]);
+  assert.deepEqual(assembleAdapterEvents(events).finishes, ['tool-calls']);
+});
+
+test('Anthropic adapter preserves mixed text, empty tools, and message-stop terminal ordering', async () => {
+  const mixedFrames = [
+    anthropicFrame('message_start', { type: 'message_start', message: { id: 'msg_mixed', model: 'claude-test' } }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'before' },
+    }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'tool_use', id: 'tool_empty', name: 'empty', input: {} },
+    }),
+    anthropicFrame('content_block_stop', { type: 'content_block_stop', index: 1 }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'after' },
+    }),
+    anthropicFrame('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
+    anthropicFrame('message_stop', { type: 'message_stop' }),
+  ];
+  const { stream, events } = await relayAnthropicFrames(mixedFrames);
+
+  assert.deepEqual(parseChatChunks(stream).map((chunk) => chunk.choices[0].delta), [
+    { role: 'assistant' },
+    { content: 'before' },
+    {
+      tool_calls: [{
+        index: 1,
+        id: 'tool_empty',
+        type: 'function',
+        function: { name: 'empty', arguments: '' },
+      }],
+    },
+    { content: 'after' },
+    {},
+  ]);
+  assert.ok(stream.indexOf('"content":"after"') < stream.indexOf('"finish_reason":"stop"'));
+  assert.ok(stream.indexOf('"finish_reason":"stop"') < stream.indexOf('data: [DONE]'));
+  assert.deepEqual(assembleAdapterEvents(events).tools, [
+    { id: 'tool_empty', index: 1, name: 'empty', arguments: '', complete: true },
+  ]);
+  assert.deepEqual(assembleAdapterEvents(events).finishes, ['stop']);
+});
+
+test('Anthropic adapter maps max-token and unknown terminal reasons predictably', async () => {
+  for (const [stopReason, chatReason, normalizedReason] of [
+    ['max_tokens', 'length', 'length'],
+    ['pause_turn', 'stop', 'stop'],
+  ]) {
+    const { stream, events } = await relayAnthropicFrames([
+      anthropicFrame('message_start', {
+        type: 'message_start', message: { id: `msg_${stopReason}`, model: 'claude-test' },
+      }),
+      anthropicFrame('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason } }),
+      anthropicFrame('message_stop', { type: 'message_stop' }),
+    ]);
+    assert.equal(parseChatChunks(stream).at(-1).choices[0].finish_reason, chatReason);
+    assert.deepEqual(assembleAdapterEvents(events).finishes, [normalizedReason]);
+    assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
+  }
 });
 
 test('Anthropic adapter translates modern tools, results, schemas, and choices without private fields', async () => {
@@ -790,6 +934,49 @@ async function sendAnthropicRequest(payload) {
   await close(router);
   await close(provider);
   return { response, requests: () => requestCount, events };
+}
+
+function anthropicFrame(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function parseChatChunks(stream) {
+  return stream
+    .split('\n')
+    .filter((line) => line.startsWith('data: {'))
+    .map((line) => JSON.parse(line.slice(6)));
+}
+
+async function relayAnthropicFrames(responseFrames) {
+  const provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const frame of responseFrames) res.write(frame);
+    res.end();
+  });
+  await listen(provider);
+  const events = [];
+  const router = makeRouter(provider, events);
+  await listen(router);
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.address().port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'byok-anthropic-claude-test',
+        messages: [{ role: 'user', content: 'Use tools' }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    return {
+      stream: await response.text(),
+      events: events.filter((event) => [
+        'text', 'reasoning', 'tool-fragment', 'tool', 'usage', 'finish', 'metadata', 'error',
+      ].includes(event.type)),
+    };
+  } finally {
+    await close(router);
+    await close(provider);
+  }
 }
 
 function makeRouter(provider, events, model = {}) {

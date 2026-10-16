@@ -653,6 +653,7 @@ function invalidAnthropicRequest(message) {
 function translateSse(source, res, onEvent) {
   let buffer = '';
   let finished = false;
+  const tools = new Map();
   const finish = (reason) => {
     if (finished) return;
     finished = true;
@@ -669,7 +670,7 @@ function translateSse(source, res, onEvent) {
     while ((boundary = buffer.indexOf('\n\n')) !== -1) {
       const frame = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
-      handleFrame(frame, res, onEvent, () => { finished = true; });
+      handleFrame(frame, res, onEvent, tools, () => { finished = true; });
     }
   });
   source.on('end', () => finish(finished ? undefined : 'stream ended before message_stop'));
@@ -677,7 +678,7 @@ function translateSse(source, res, onEvent) {
   source.on('aborted', () => finish('stream aborted by the remote end'));
 }
 
-function handleFrame(frame, res, onEvent, markFinished) {
+function handleFrame(frame, res, onEvent, tools, markFinished) {
   const event = frame.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
   const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
   if (!data) return;
@@ -689,11 +690,51 @@ function handleFrame(frame, res, onEvent, markFinished) {
   }
   if (event === 'message_start') {
     writeChunk(res, value.message?.id, value.message?.model, { role: 'assistant' });
+  } else if (event === 'content_block_start' && value.content_block?.type === 'tool_use') {
+    const tool = {
+      id: value.content_block.id,
+      index: value.index,
+      name: value.content_block.name,
+      arguments: '',
+    };
+    tools.set(value.index, tool);
+    onEvent({ type: 'tool-fragment', ...tool });
+    writeChunk(res, undefined, undefined, {
+      tool_calls: [{
+        index: tool.index,
+        id: tool.id,
+        type: 'function',
+        function: { name: tool.name, arguments: '' },
+      }],
+    });
   } else if (event === 'content_block_delta' && value.delta?.type === 'text_delta') {
     onEvent({ type: 'text', text: value.delta.text });
     writeChunk(res, undefined, undefined, { content: value.delta.text });
+  } else if (event === 'content_block_delta' && value.delta?.type === 'input_json_delta') {
+    const tool = tools.get(value.index);
+    if (!tool) return;
+    tool.arguments += value.delta.partial_json;
+    onEvent({
+      type: 'tool-fragment',
+      index: tool.index,
+      id: tool.id,
+      arguments: value.delta.partial_json,
+    });
+    writeChunk(res, undefined, undefined, {
+      tool_calls: [{
+        index: tool.index,
+        function: { arguments: value.delta.partial_json },
+      }],
+    });
+  } else if (event === 'content_block_stop') {
+    const tool = tools.get(value.index);
+    if (!tool) return;
+    onEvent({ type: 'tool', ...tool });
+    tools.delete(value.index);
   } else if (event === 'message_delta') {
-    writeChunk(res, undefined, undefined, {}, mapStopReason(value.delta?.stop_reason));
+    const stopReason = value.delta?.stop_reason;
+    if (stopReason) onEvent({ type: 'finish', reason: mapNormalizedStopReason(stopReason) });
+    writeChunk(res, undefined, undefined, {}, mapStopReason(stopReason));
   } else if (event === 'error') {
     const error = new AdapterEventError(value.error?.message || 'Anthropic provider error.', { category: 'upstream', retryable: false });
     onEvent({ type: 'error', error: error.toEvent().error });
@@ -718,6 +759,12 @@ function mapStopReason(reason) {
   if (reason === 'max_tokens') return 'length';
   if (reason === 'tool_use') return 'tool_calls';
   return reason ? 'stop' : null;
+}
+
+function mapNormalizedStopReason(reason) {
+  if (reason === 'max_tokens') return 'length';
+  if (reason === 'tool_use') return 'tool-calls';
+  return 'stop';
 }
 
 function respondJson(res, status, payload) {
