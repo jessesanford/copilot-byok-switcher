@@ -653,7 +653,11 @@ function invalidAnthropicRequest(message) {
 function translateSse(source, res, onEvent) {
   let buffer = '';
   let finished = false;
-  const tools = new Map();
+  const state = {
+    blocks: new Map(),
+    tools: new Map(),
+    usage: {},
+  };
   const finish = (reason) => {
     if (finished) return;
     finished = true;
@@ -670,7 +674,7 @@ function translateSse(source, res, onEvent) {
     while ((boundary = buffer.indexOf('\n\n')) !== -1) {
       const frame = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
-      handleFrame(frame, res, onEvent, tools, () => { finished = true; });
+      handleFrame(frame, res, onEvent, state, () => { finished = true; });
     }
   });
   source.on('end', () => finish(finished ? undefined : 'stream ended before message_stop'));
@@ -678,7 +682,7 @@ function translateSse(source, res, onEvent) {
   source.on('aborted', () => finish('stream aborted by the remote end'));
 }
 
-function handleFrame(frame, res, onEvent, tools, markFinished) {
+function handleFrame(frame, res, onEvent, state, markFinished) {
   const event = frame.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
   const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
   if (!data) return;
@@ -689,15 +693,31 @@ function handleFrame(frame, res, onEvent, tools, markFinished) {
     return;
   }
   if (event === 'message_start') {
-    writeChunk(res, value.message?.id, value.message?.model, { role: 'assistant' });
-  } else if (event === 'content_block_start' && value.content_block?.type === 'tool_use') {
+    const { id, model, usage } = value.message || {};
+    onEvent({
+      type: 'metadata',
+      namespace: 'anthropic',
+      data: { message: { ...(id === undefined ? {} : { id }), ...(model === undefined ? {} : { model }) } },
+    });
+    emitAnthropicUsage(onEvent, state.usage, usage);
+    writeChunk(res, id, model, { role: 'assistant' });
+  } else if (event === 'content_block_start') {
+    const block = value.content_block;
+    if (!block?.type || !Number.isInteger(value.index) || value.index < 0) return;
+    state.blocks.set(value.index, block.type);
+    const data = {
+      contentBlock: { index: value.index, type: block.type },
+      ...(block.type === 'redacted_thinking' ? { redactedThinking: block.data } : {}),
+    };
+    onEvent({ type: 'metadata', namespace: 'anthropic', data });
+    if (block.type !== 'tool_use') return;
     const tool = {
-      id: value.content_block.id,
+      id: block.id,
       index: value.index,
-      name: value.content_block.name,
+      name: block.name,
       arguments: '',
     };
-    tools.set(value.index, tool);
+    state.tools.set(value.index, tool);
     onEvent({ type: 'tool-fragment', ...tool });
     writeChunk(res, undefined, undefined, {
       tool_calls: [{
@@ -710,8 +730,22 @@ function handleFrame(frame, res, onEvent, tools, markFinished) {
   } else if (event === 'content_block_delta' && value.delta?.type === 'text_delta') {
     onEvent({ type: 'text', text: value.delta.text });
     writeChunk(res, undefined, undefined, { content: value.delta.text });
+  } else if (event === 'content_block_delta' && value.delta?.type === 'thinking_delta') {
+    onEvent({ type: 'reasoning', text: value.delta.thinking });
+  } else if (event === 'content_block_delta' && value.delta?.type === 'signature_delta') {
+    onEvent({
+      type: 'metadata',
+      namespace: 'anthropic',
+      data: {
+        contentBlock: {
+          index: value.index,
+          type: state.blocks.get(value.index) || 'thinking',
+        },
+        signature: value.delta.signature,
+      },
+    });
   } else if (event === 'content_block_delta' && value.delta?.type === 'input_json_delta') {
-    const tool = tools.get(value.index);
+    const tool = state.tools.get(value.index);
     if (!tool) return;
     tool.arguments += value.delta.partial_json;
     onEvent({
@@ -727,13 +761,20 @@ function handleFrame(frame, res, onEvent, tools, markFinished) {
       }],
     });
   } else if (event === 'content_block_stop') {
-    const tool = tools.get(value.index);
+    const tool = state.tools.get(value.index);
     if (!tool) return;
     onEvent({ type: 'tool', ...tool });
-    tools.delete(value.index);
+    state.tools.delete(value.index);
   } else if (event === 'message_delta') {
     const stopReason = value.delta?.stop_reason;
-    if (stopReason) onEvent({ type: 'finish', reason: mapNormalizedStopReason(stopReason) });
+    emitAnthropicUsage(onEvent, state.usage, value.usage);
+    if (stopReason) {
+      onEvent({
+        type: 'finish',
+        reason: mapNormalizedStopReason(stopReason),
+        metadata: { anthropic: { stopReason } },
+      });
+    }
     writeChunk(res, undefined, undefined, {}, mapStopReason(stopReason));
   } else if (event === 'error') {
     const error = new AdapterEventError(value.error?.message || 'Anthropic provider error.', { category: 'upstream', retryable: false });
@@ -743,6 +784,28 @@ function handleFrame(frame, res, onEvent, tools, markFinished) {
     markFinished();
     res.end();
   }
+}
+
+function emitAnthropicUsage(onEvent, accumulated, nativeUsage) {
+  if (!nativeUsage || typeof nativeUsage !== 'object' || Array.isArray(nativeUsage)) return;
+  for (const [nativeName, normalizedName] of [
+    ['input_tokens', 'inputTokens'],
+    ['output_tokens', 'outputTokens'],
+    ['cache_creation_input_tokens', 'cacheCreationInputTokens'],
+    ['cache_read_input_tokens', 'cacheReadInputTokens'],
+  ]) {
+    const value = nativeUsage[nativeName];
+    if (Number.isFinite(value) && value >= 0) accumulated[normalizedName] = value;
+  }
+  if (!Object.keys(accumulated).length) return;
+  const usage = { ...accumulated };
+  if (usage.outputTokens !== undefined) {
+    usage.totalTokens = (usage.inputTokens || 0)
+      + (usage.cacheCreationInputTokens || 0)
+      + (usage.cacheReadInputTokens || 0)
+      + usage.outputTokens;
+  }
+  onEvent({ type: 'usage', usage });
 }
 
 function writeChunk(res, id, model, delta, finishReason = null) {

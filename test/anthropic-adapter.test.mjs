@@ -190,6 +190,113 @@ test('Anthropic adapter preserves mixed text, empty tools, and message-stop term
   assert.deepEqual(assembleAdapterEvents(events).finishes, ['stop']);
 });
 
+test('Anthropic adapter preserves thinking, signatures, redactions, identity, and cache-aware usage', async () => {
+  const redactedPayload = 'encrypted-redacted-payload';
+  const signature = 'signature-bytes';
+  const { stream, events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_thinking',
+        model: 'claude-provider-model',
+        usage: {
+          input_tokens: 5,
+          cache_creation_input_tokens: 7,
+          cache_read_input_tokens: 11,
+        },
+      },
+    }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'thinking', thinking: '' },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'thinking_delta', thinking: 'First ' },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'thinking_delta', thinking: 'then second.' },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'signature_delta', signature },
+    }),
+    anthropicFrame('content_block_start', {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'redacted_thinking', data: redactedPayload },
+    }),
+    anthropicFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 2,
+      delta: { type: 'text_delta', text: 'Visible answer' },
+    }),
+    anthropicFrame('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'pause_turn' },
+      usage: { output_tokens: 13 },
+    }),
+    anthropicFrame('message_stop', { type: 'message_stop' }),
+  ]);
+  const assembled = assembleAdapterEvents(events);
+
+  assert.equal(assembled.reasoning, 'First then second.');
+  assert.equal(assembled.text, 'Visible answer');
+  assert.deepEqual(assembled.usage, [
+    {
+      inputTokens: 5,
+      cacheCreationInputTokens: 7,
+      cacheReadInputTokens: 11,
+    },
+    {
+      inputTokens: 5,
+      outputTokens: 13,
+      cacheCreationInputTokens: 7,
+      cacheReadInputTokens: 11,
+      totalTokens: 36,
+    },
+  ]);
+  assert.deepEqual(assembled.metadata.anthropic, [
+    { message: { id: 'msg_thinking', model: 'claude-provider-model' } },
+    { contentBlock: { index: 0, type: 'thinking' } },
+    { contentBlock: { index: 0, type: 'thinking' }, signature },
+    {
+      contentBlock: { index: 1, type: 'redacted_thinking' },
+      redactedThinking: redactedPayload,
+    },
+    { stopReason: 'pause_turn' },
+  ]);
+  assert.deepEqual(assembled.finishes, ['stop']);
+  assert.equal(parseChatChunks(stream)[0].model, 'claude-provider-model');
+  assert.match(stream, /"content":"Visible answer"/);
+  assert.doesNotMatch(stream, /First |then second|signature-bytes|encrypted-redacted-payload/);
+});
+
+test('Anthropic adapter omits missing cache counters from usage snapshots', async () => {
+  const { events } = await relayAnthropicFrames([
+    anthropicFrame('message_start', {
+      type: 'message_start',
+      message: { id: 'msg_usage', model: 'claude-test', usage: { input_tokens: 3 } },
+    }),
+    anthropicFrame('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 2 },
+    }),
+    anthropicFrame('message_stop', { type: 'message_stop' }),
+  ]);
+
+  assert.deepEqual(assembleAdapterEvents(events).usage, [
+    { inputTokens: 3 },
+    { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+  ]);
+});
+
 test('Anthropic adapter maps max-token and unknown terminal reasons predictably', async () => {
   for (const [stopReason, chatReason, normalizedReason] of [
     ['max_tokens', 'length', 'length'],
@@ -203,7 +310,9 @@ test('Anthropic adapter maps max-token and unknown terminal reasons predictably'
       anthropicFrame('message_stop', { type: 'message_stop' }),
     ]);
     assert.equal(parseChatChunks(stream).at(-1).choices[0].finish_reason, chatReason);
-    assert.deepEqual(assembleAdapterEvents(events).finishes, [normalizedReason]);
+    const assembled = assembleAdapterEvents(events);
+    assert.deepEqual(assembled.finishes, [normalizedReason]);
+    assert.deepEqual(assembled.metadata.anthropic.at(-1), { stopReason });
     assert.equal(stream.match(/data: \[DONE\]/g)?.length, 1);
   }
 });
