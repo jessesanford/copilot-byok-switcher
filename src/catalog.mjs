@@ -64,16 +64,43 @@ function buildRoute({ id, provider, model, entry }) {
   );
   const wireModel = requiredRouteString(model.wireModel ?? model.model, 'wire model', id);
   const authPolicy = normalizeAuthPolicy(model.authPolicy ?? provider.authPolicy, provider, id);
+  const routeProvider = cloneValue(provider);
+  if (model.providerBaseUrl != null) {
+    routeProvider.baseUrl = routeBaseUrl(model.providerBaseUrl, id);
+  }
+  const capabilities = normalizeRouteCapabilities(model.routeCapabilities, entry.capabilities, id);
 
   return deepFreeze({
-    provider: cloneValue(provider),
+    provider: routeProvider,
     model: cloneValue(model),
     adapterKind,
     endpointFamily,
     wireModel,
-    capabilities: entry.capabilities,
+    capabilities,
     authPolicy,
   });
+}
+
+function normalizeRouteCapabilities(value, defaults, id) {
+  if (value == null) return defaults;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`Route ${id} capabilities must be an object.`);
+  }
+  return cloneValue(value);
+}
+
+function routeBaseUrl(value, id) {
+  const normalized = requiredRouteString(value, 'provider base URL', id);
+  let url;
+  try {
+    url = new URL(normalized);
+  } catch (error) {
+    throw new TypeError(`Route ${id} provider base URL must be an absolute HTTP(S) URL.`, { cause: error });
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new TypeError(`Route ${id} provider base URL must be an absolute HTTP(S) URL without credentials.`);
+  }
+  return url.href.replace(/\/+$/, '');
 }
 
 function routeIdentifier(value, field, id) {

@@ -88,18 +88,25 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
       return;
     }
 
-    if (responses && providerRes.statusCode >= 200 && providerRes.statusCode < 300
-      && String(providerRes.headers['content-type'] || '').includes('text/event-stream')) {
-      relayResponsesStream(providerRes, res, route.wireModel);
+    const responsesStream = responses && providerRes.statusCode >= 200 && providerRes.statusCode < 300
+      && String(providerRes.headers['content-type'] || '').includes('text/event-stream');
+    if (responsesStream) {
+      relayResponsesStream(providerRes, res, route.wireModel, {
+        onEvent,
+        provider: provider.id,
+        signal,
+      });
     } else {
       res.writeHead(providerRes.statusCode, providerRes.headers);
       providerRes.pipe(res);
     }
-    endOnBrokenSource(providerRes, res, (message) => {
-      if (signal?.aborted || res.destroyed) return;
-      const truncated = new AdapterEventError(message, { category: 'truncated', retryable: true });
-      onEvent({ type: 'error', provider: provider.id, message, error: truncated.toEvent().error });
-    });
+    if (!responsesStream) {
+      endOnBrokenSource(providerRes, res, (message) => {
+        if (signal?.aborted || res.destroyed || res.writableEnded) return;
+        const truncated = new AdapterEventError(message, { category: 'truncated', retryable: true });
+        onEvent({ type: 'error', provider: provider.id, message, error: truncated.toEvent().error });
+      });
+    }
   });
 
   let timedOut = false;
@@ -124,94 +131,543 @@ function forwardOpenAI({ req, res, payload, route, onEvent, providerIdleTimeoutM
   providerReq.end(body);
 }
 
-function relayResponsesStream(source, res, model) {
+function relayResponsesStream(source, res, model, { onEvent, provider, signal }) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   let buffer = '';
   let finished = false;
+  const emittedText = new Map();
+  const emittedRefusal = new Map();
   const toolCalls = new Map();
-  const finish = (id = 'response') => {
+  const toolAliases = new Map();
+  const writeChunk = (id, delta, finishReason = null) => {
+    res.write(`data: ${JSON.stringify({
+      id,
+      object: 'chat.completion.chunk',
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    })}\n\n`);
+  };
+  const releaseSource = () => {
+    if (!source.destroyed) source.destroy();
+  };
+  const removeAbortListener = () => signal?.removeEventListener('abort', cancel);
+  const cancel = () => {
     if (finished) return;
     finished = true;
-    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: toolCalls.size ? 'tool_calls' : 'stop' }] })}\n\n`);
+    releaseSource();
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
+  const fail = (message, options = {}) => {
+    if (finished) return;
+    finished = true;
+    removeAbortListener();
+    const error = new AdapterEventError(message, {
+      category: 'malformed-response',
+      retryable: false,
+      ...options,
+    });
+    onEvent({ type: 'error', provider, error: error.toEvent().error });
+    if (!res.writableEnded && !res.destroyed) {
+      res.write(`data: ${JSON.stringify({ error: error.toEvent().error })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    }
+    releaseSource();
+  };
+  const validateToolCalls = () => {
+    for (const [callId, call] of toolCalls) {
+      if (!call.name) throw new Error(`Responses tool call "${callId}" is missing a function name.`);
+      try {
+        JSON.parse(call.arguments || '{}');
+      } catch {
+        throw new Error(`Responses tool call "${callId}" produced malformed arguments.`);
+      }
+    }
+  };
+  const finish = (id = 'response') => {
+    if (finished) return;
+    try {
+      validateToolCalls();
+    } catch (error) {
+      fail(error.message);
+      return;
+    }
+    finished = true;
+    removeAbortListener();
+    writeChunk(id, {}, toolCalls.size ? 'tool_calls' : 'stop');
     res.end('data: [DONE]\n\n');
+    releaseSource();
+  };
+  const addTool = (event) => {
+    const item = event.item;
+    const callId = item.call_id || item.id;
+    if (typeof callId !== 'string' || !callId || typeof item.name !== 'string' || !item.name) {
+      throw new Error('Responses function call items require a call ID and function name.');
+    }
+    const existing = toolCalls.get(callId) || toolAliases.get(callId);
+    if (existing) {
+      if (existing.name !== item.name) {
+        throw new Error(`Responses tool call "${callId}" changed its function name.`);
+      }
+      if (typeof item.id === 'string' && item.id) toolAliases.set(item.id, existing);
+      return existing;
+    }
+    const call = {
+      index: toolCalls.size,
+      name: item.name,
+      arguments: typeof item.arguments === 'string' ? item.arguments : '',
+    };
+    toolCalls.set(callId, call);
+    toolAliases.set(callId, call);
+    if (typeof item.id === 'string' && item.id) toolAliases.set(item.id, call);
+    writeChunk(event.response?.id || 'response', {
+      tool_calls: [{
+        index: call.index,
+        id: callId,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments },
+      }],
+    });
+    return call;
+  };
+  const appendToolArguments = (event, complete) => {
+    const callId = event.call_id || event.item_id;
+    const call = toolAliases.get(callId);
+    if (!call) throw new Error('Responses tool argument events require a known call ID.');
+    const incoming = complete ? event.arguments : event.delta;
+    if (typeof incoming !== 'string') {
+      throw new Error(`Responses tool call "${callId}" emitted non-string arguments.`);
+    }
+    let fragment = incoming;
+    if (complete) {
+      if (incoming.startsWith(call.arguments)) fragment = incoming.slice(call.arguments.length);
+      else if (call.arguments) {
+        throw new Error(`Responses tool call "${callId}" completed with inconsistent arguments.`);
+      }
+    }
+    if (fragment) {
+      call.arguments += fragment;
+      writeChunk(event.response?.id || 'response', {
+        tool_calls: [{ index: call.index, function: { arguments: fragment } }],
+      });
+    }
+    if (complete) {
+      try {
+        JSON.parse(call.arguments || '{}');
+      } catch {
+        throw new Error(`Responses tool call "${callId}" produced malformed arguments.`);
+      }
+    }
   };
   source.setEncoding('utf8');
   source.on('data', (chunk) => {
+    if (signal?.aborted || finished) return;
     buffer += chunk;
-    const frames = buffer.split(/\n\n/);
+    const frames = buffer.split(/\r?\n\r?\n/);
     buffer = frames.pop();
     for (const frame of frames) {
-      const line = frame.split('\n').find((entry) => entry.startsWith('data:'));
-      if (!line || finished) continue;
-      const data = line.slice(5).trim();
+      const lines = frame.split(/\r?\n/).filter((entry) => entry.startsWith('data:'));
+      if (!lines.length || finished) continue;
+      const data = lines.map((line) => line.slice(5).trimStart()).join('\n').trim();
       if (data === '[DONE]') {
         finish();
         continue;
       }
       let event;
-      try { event = JSON.parse(data); } catch { continue; }
+      try {
+        event = JSON.parse(data);
+      } catch {
+        fail('The provider stream contained invalid JSON.');
+        continue;
+      }
       const id = event.response?.id || 'response';
-      if (event.type === 'response.output_text.delta') {
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: event.delta || '' }, finish_reason: null }] })}\n\n`);
-      } else if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
-        const index = toolCalls.size;
-        const callId = event.item.call_id || event.item.id || `call_${index}`;
-        toolCalls.set(callId, index);
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index, id: callId, type: 'function', function: { name: event.item.name || '', arguments: event.item.arguments || '' } }] }, finish_reason: null }] })}\n\n`);
-      } else if (event.type === 'response.function_call_arguments.delta') {
-        const callId = event.call_id || event.item_id;
-        const index = toolCalls.get(callId) ?? toolCalls.size;
-        if (!toolCalls.has(callId)) toolCalls.set(callId, index);
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index, function: { arguments: event.delta || '' } }] }, finish_reason: null }] })}\n\n`);
-      } else if (event.type === 'response.completed' || event.type === 'response.done') {
-        finish(id);
+      try {
+        if (event.type === 'response.output_text.delta') {
+          const text = typeof event.delta === 'string' ? event.delta : '';
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          emittedText.set(key, `${emittedText.get(key) || ''}${text}`);
+          writeChunk(id, { content: text });
+        } else if (event.type === 'response.output_text.done' && typeof event.text === 'string') {
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          const previous = emittedText.get(key) || '';
+          const suffix = event.text.startsWith(previous) ? event.text.slice(previous.length) : event.text;
+          if (suffix) {
+            emittedText.set(key, `${previous}${suffix}`);
+            writeChunk(id, { content: suffix });
+          }
+        } else if (event.type === 'response.refusal.delta') {
+          const refusal = typeof event.delta === 'string' ? event.delta : '';
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          emittedRefusal.set(key, `${emittedRefusal.get(key) || ''}${refusal}`);
+          writeChunk(id, { refusal });
+        } else if (event.type === 'response.refusal.done') {
+          const refusal = typeof event.refusal === 'string' ? event.refusal
+            : typeof event.text === 'string' ? event.text : '';
+          const key = `${event.output_index ?? event.item_id ?? 'default'}:${event.content_index ?? 0}`;
+          const previous = emittedRefusal.get(key) || '';
+          const suffix = refusal.startsWith(previous) ? refusal.slice(previous.length) : refusal;
+          if (suffix) {
+            emittedRefusal.set(key, `${previous}${suffix}`);
+            writeChunk(id, { refusal: suffix });
+          }
+        } else if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
+          addTool(event);
+        } else if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
+          const call = addTool(event);
+          appendToolArguments({ ...event, call_id: event.item.call_id || event.item.id, arguments: event.item.arguments || call.arguments }, true);
+        } else if (event.type === 'response.function_call_arguments.delta') {
+          appendToolArguments(event, false);
+        } else if (event.type === 'response.function_call_arguments.done') {
+          appendToolArguments(event, true);
+        } else if (event.type === 'response.completed' || event.type === 'response.done') {
+          finish(id);
+        } else if (event.type === 'response.failed') {
+          fail(
+            event.response?.error?.message || 'The provider failed to complete the response.',
+            { category: 'upstream', retryable: false },
+          );
+        } else if (event.type === 'response.incomplete') {
+          const reason = event.response?.incomplete_details?.reason;
+          fail(
+            reason
+              ? `The provider returned an incomplete response: ${reason}.`
+              : 'The provider returned an incomplete response.',
+            { category: 'truncated', retryable: true },
+          );
+        } else if (event.type === 'error') {
+          fail(
+            event.error?.message || event.message || 'The provider stream failed.',
+            { category: 'upstream', retryable: Boolean(event.error?.retryable) },
+          );
+        }
+      } catch (error) {
+        fail(error.message);
       }
     }
   });
   source.on('end', () => {
-    if (!finished) finish();
+    if (!finished) {
+      fail(
+        'The provider stream ended before an explicit terminal event.',
+        { category: 'truncated', retryable: true },
+      );
+    }
+  });
+  source.on('error', () => {
+    if (signal?.aborted || res.destroyed) {
+      cancel();
+      return;
+    }
+    fail(
+      'The provider response stream was interrupted.',
+      { category: 'truncated', retryable: true },
+    );
+  });
+  source.on('aborted', () => {
+    if (signal?.aborted || res.destroyed) {
+      cancel();
+      return;
+    }
+    fail(
+      'The provider response stream was aborted by the remote end.',
+      { category: 'truncated', retryable: true },
+    );
   });
 }
 
 function toResponsesPayload(payload, wireModel) {
-  const outbound = { ...payload, model: wireModel };
-  if (outbound.messages && !outbound.input) {
-    outbound.input = outbound.messages;
-    delete outbound.messages;
+  const outbound = { model: wireModel };
+  const input = payload.input ?? payload.messages;
+  if (typeof input === 'string') outbound.input = input;
+  else if (Array.isArray(input)) outbound.input = toResponsesInput(input);
+  if (typeof payload.instructions === 'string') outbound.instructions = payload.instructions;
+  if (typeof payload.stream === 'boolean') outbound.stream = payload.stream;
+  if (Array.isArray(payload.tools)) outbound.tools = payload.tools.map(toResponsesTool);
+  const toolChoice = toResponsesToolChoice(payload.tool_choice);
+  if (toolChoice !== undefined) outbound.tool_choice = toolChoice;
+  if (typeof payload.parallel_tool_calls === 'boolean') {
+    outbound.parallel_tool_calls = payload.parallel_tool_calls;
   }
-  if (Array.isArray(outbound.input)) outbound.input = toResponsesInput(outbound.input);
-  delete outbound.reasoning_effort;
-  delete outbound.temperature;
-  delete outbound.top_p;
-  delete outbound.stream_options;
-  if (Array.isArray(outbound.tools)) {
-    outbound.tools = outbound.tools.map((tool) => {
-      if (tool?.type !== 'function' || !tool.function) return tool;
-      return { type: 'function', ...tool.function };
-    });
+  const maxOutputTokens = payload.max_output_tokens ?? payload.max_completion_tokens ?? payload.max_tokens;
+  if (Number.isInteger(maxOutputTokens) && maxOutputTokens > 0) {
+    outbound.max_output_tokens = maxOutputTokens;
   }
+  if (typeof payload.store === 'boolean') outbound.store = payload.store;
+  if (typeof payload.previous_response_id === 'string') {
+    outbound.previous_response_id = payload.previous_response_id;
+  }
+  if (Array.isArray(payload.include)) {
+    outbound.include = payload.include.filter((entry) => typeof entry === 'string');
+  }
+  if (typeof payload.truncation === 'string') outbound.truncation = payload.truncation;
+  if (typeof payload.user === 'string') outbound.user = payload.user;
   return outbound;
 }
 
 function toResponsesInput(messages) {
-  return messages.flatMap((message) => {
+  const items = [];
+  const pendingLegacyCalls = [];
+  for (const [index, message] of messages.entries()) {
+    if (message?.type === 'function_call') {
+      items.push(canonicalFunctionCall(message, index));
+      continue;
+    }
+    if (message?.type === 'function_call_output') {
+      items.push(canonicalFunctionOutput(message));
+      continue;
+    }
     if (message?.role === 'tool') {
-      return { type: 'function_call_output', call_id: message.tool_call_id, output: message.content ?? '' };
+      items.push(canonicalFunctionOutput({
+        call_id: message.tool_call_id,
+        output: message.content,
+      }));
+      continue;
     }
-    if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) return message;
-    const items = [];
-    if (message.content != null) items.push({ role: 'assistant', content: [{ type: 'output_text', text: message.content }] });
-    for (const call of message.tool_calls) {
-      const fn = call?.function;
-      if (!fn?.name) continue;
-      items.push({
-        type: 'function_call',
-        call_id: call.id,
-        name: fn.name,
-        arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
-      });
+    if (message?.role === 'function') {
+      const explicitCallId = message.tool_call_id || message.call_id || message.id;
+      const matchingIndex = explicitCallId
+        ? pendingLegacyCalls.findIndex((call) => call.callId === explicitCallId)
+        : pendingLegacyCalls.findIndex((call) => (
+          typeof message.name !== 'string' || !message.name || call.name === message.name
+        ));
+      const pending = matchingIndex === -1 ? undefined : pendingLegacyCalls.splice(matchingIndex, 1)[0];
+      items.push(canonicalFunctionOutput({
+        call_id: explicitCallId || pending?.callId,
+        output: message.content,
+      }));
+      continue;
     }
-    return items;
+    if (!['system', 'developer', 'user', 'assistant'].includes(message?.role)) continue;
+    const content = canonicalMessageContent(message.role, message.content, message.refusal);
+    if (content.length) items.push({ role: message.role, content });
+    if (message.role === 'assistant' && message.function_call != null) {
+      const callId = message.tool_call_id || message.call_id || message.id || `call_${index}`;
+      items.push(canonicalFunctionCall({
+        call_id: callId,
+        name: message.function_call.name,
+        arguments: message.function_call.arguments,
+      }, index));
+      pendingLegacyCalls.push({ callId, name: message.function_call.name });
+    }
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        items.push(canonicalFunctionCall({
+          call_id: call?.id,
+          name: call?.function?.name,
+          arguments: call?.function?.arguments,
+        }, index));
+      }
+    }
+  }
+  return items;
+}
+
+function canonicalMessageContent(role, content, refusal) {
+  const parts = [];
+  const addText = (text) => {
+    if (typeof text !== 'string') return;
+    parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text });
+  };
+  if (typeof content === 'string') {
+    addText(content);
+  } else if (Array.isArray(content)) {
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue;
+      if (['text', 'input_text', 'output_text'].includes(part.type)) {
+        addText(part.text);
+      } else if (role === 'user' && part.type === 'image_url') {
+        const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+        if (typeof imageUrl === 'string') {
+          parts.push({
+            type: 'input_image',
+            image_url: imageUrl,
+            ...(['low', 'high', 'auto'].includes(part.image_url?.detail) ? { detail: part.image_url.detail } : {}),
+          });
+        }
+      } else if (role === 'user' && part.type === 'input_image') {
+        if (typeof part.image_url === 'string') {
+          parts.push({
+            type: 'input_image',
+            image_url: part.image_url,
+            ...(['low', 'high', 'auto'].includes(part.detail) ? { detail: part.detail } : {}),
+          });
+        } else if (typeof part.file_id === 'string') {
+          parts.push({
+            type: 'input_image',
+            file_id: part.file_id,
+            ...(['low', 'high', 'auto'].includes(part.detail) ? { detail: part.detail } : {}),
+          });
+        }
+      } else if (role === 'assistant' && part.type === 'refusal' && typeof part.refusal === 'string') {
+        parts.push({ type: 'refusal', refusal: part.refusal });
+      }
+    }
+  }
+  if (role === 'assistant' && typeof refusal === 'string') {
+    parts.push({ type: 'refusal', refusal });
+  }
+  return parts;
+}
+
+function canonicalFunctionCall(call, index) {
+  if (typeof call.call_id !== 'string' || !call.call_id) {
+    throw invalidResponsesRequest(`Responses function call ${index + 1} is missing a call ID.`);
+  }
+  if (typeof call.name !== 'string' || !call.name) {
+    throw invalidResponsesRequest(`Responses function call "${call.call_id}" is missing a function name.`);
+  }
+  let args;
+  if (typeof call.arguments === 'string') args = call.arguments;
+  else {
+    try {
+      args = JSON.stringify(call.arguments ?? {});
+    } catch {
+      throw invalidResponsesRequest(`Responses function call "${call.call_id}" has invalid arguments.`);
+    }
+  }
+  try {
+    JSON.parse(args);
+  } catch {
+    throw invalidResponsesRequest(`Responses function call "${call.call_id}" has malformed arguments.`);
+  }
+  return {
+    type: 'function_call',
+    call_id: call.call_id,
+    name: call.name,
+    arguments: args,
+  };
+}
+
+function canonicalFunctionOutput(item) {
+  if (typeof item.call_id !== 'string' || !item.call_id) {
+    throw invalidResponsesRequest('Responses tool output is missing a call ID.');
+  }
+  let output = item.output ?? '';
+  if (Array.isArray(output)) {
+    output = output.map(canonicalFunctionOutputPart).filter(Boolean);
+  } else if (typeof output !== 'string') {
+    output = JSON.stringify(output);
+  }
+  return { type: 'function_call_output', call_id: item.call_id, output };
+}
+
+function canonicalFunctionOutputPart(part) {
+  if (!part || typeof part !== 'object') return undefined;
+  if (['text', 'input_text'].includes(part.type) && typeof part.text === 'string') {
+    return { type: 'input_text', text: part.text };
+  }
+  if (part.type === 'input_image') {
+    const image = { type: 'input_image' };
+    if (typeof part.image_url === 'string') image.image_url = part.image_url;
+    else if (typeof part.file_id === 'string') image.file_id = part.file_id;
+    else return undefined;
+    if (['low', 'high', 'auto'].includes(part.detail)) image.detail = part.detail;
+    return image;
+  }
+  if (part.type === 'input_file') {
+    const file = { type: 'input_file' };
+    for (const field of ['file_id', 'file_url', 'file_data', 'filename']) {
+      if (typeof part[field] === 'string') file[field] = part[field];
+    }
+    return Object.keys(file).length > 1 ? file : undefined;
+  }
+  return undefined;
+}
+
+function toResponsesTool(tool) {
+  const fn = tool?.type === 'function' && tool.function ? tool.function : tool;
+  if (tool?.type !== 'function' || typeof fn?.name !== 'string' || !fn.name) {
+    throw invalidResponsesRequest('Responses function tools require a function name.');
+  }
+  return {
+    type: 'function',
+    name: fn.name,
+    ...(typeof fn.description === 'string' ? { description: fn.description } : {}),
+    ...((typeof fn.parameters === 'boolean'
+      || (fn.parameters && typeof fn.parameters === 'object' && !Array.isArray(fn.parameters)))
+      ? { parameters: canonicalJsonSchema(fn.parameters) } : {}),
+    ...(typeof fn.strict === 'boolean' ? { strict: fn.strict } : {}),
+  };
+}
+
+function canonicalJsonSchema(schema) {
+  if (typeof schema === 'boolean') return schema;
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return {};
+
+  const result = {};
+  for (const key of ['$ref', 'type', 'title', 'description', 'format', 'pattern', 'contentEncoding', 'contentMediaType']) {
+    if (typeof schema[key] === 'string') result[key] = schema[key];
+  }
+  if (Array.isArray(schema.type)) {
+    result.type = schema.type.filter((entry) => typeof entry === 'string');
+  }
+  for (const key of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf']) {
+    if (typeof schema[key] === 'number' && Number.isFinite(schema[key])) result[key] = schema[key];
+  }
+  for (const key of [
+    'minLength', 'maxLength', 'minItems', 'maxItems', 'minContains', 'maxContains',
+    'minProperties', 'maxProperties',
+  ]) {
+    if (Number.isInteger(schema[key]) && schema[key] >= 0) result[key] = schema[key];
+  }
+  for (const key of ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated']) {
+    if (typeof schema[key] === 'boolean') result[key] = schema[key];
+  }
+  for (const key of ['enum', 'examples']) {
+    if (Array.isArray(schema[key])) result[key] = structuredClone(schema[key]);
+  }
+  for (const key of ['const', 'default']) {
+    if (schema[key] !== undefined) result[key] = structuredClone(schema[key]);
+  }
+  if (Array.isArray(schema.required)) {
+    result.required = schema.required.filter((entry) => typeof entry === 'string');
+  }
+  for (const key of ['allOf', 'anyOf', 'oneOf', 'prefixItems']) {
+    if (Array.isArray(schema[key])) result[key] = schema[key].map(canonicalJsonSchema);
+  }
+  for (const key of [
+    'not', 'if', 'then', 'else', 'items', 'contains', 'additionalProperties',
+    'unevaluatedProperties', 'propertyNames', 'unevaluatedItems',
+  ]) {
+    if (typeof schema[key] === 'boolean' || (schema[key] && typeof schema[key] === 'object' && !Array.isArray(schema[key]))) {
+      result[key] = canonicalJsonSchema(schema[key]);
+    }
+  }
+  for (const key of ['properties', 'patternProperties', '$defs', 'dependentSchemas']) {
+    if (schema[key] && typeof schema[key] === 'object' && !Array.isArray(schema[key])) {
+      result[key] = Object.fromEntries(
+        Object.entries(schema[key]).map(([name, value]) => [name, canonicalJsonSchema(value)]),
+      );
+    }
+  }
+  if (schema.dependentRequired && typeof schema.dependentRequired === 'object'
+    && !Array.isArray(schema.dependentRequired)) {
+    result.dependentRequired = Object.fromEntries(
+      Object.entries(schema.dependentRequired)
+        .filter(([, value]) => Array.isArray(value))
+        .map(([name, value]) => [name, value.filter((entry) => typeof entry === 'string')]),
+    );
+  }
+  return result;
+}
+
+function toResponsesToolChoice(choice) {
+  if (['auto', 'none', 'required'].includes(choice)) return choice;
+  if (choice?.type === 'function') {
+    const name = choice.name || choice.function?.name;
+    if (typeof name !== 'string' || !name) {
+      throw invalidResponsesRequest('Responses function tool choice requires a function name.');
+    }
+    return { type: 'function', name };
+  }
+  return undefined;
+}
+
+function invalidResponsesRequest(message) {
+  return new AdapterEventError(message, {
+    category: 'invalid-request',
+    status: 400,
+    retryable: false,
   });
 }
 
