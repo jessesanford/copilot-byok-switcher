@@ -63,6 +63,8 @@ test('declared route metadata is validated, model-scoped, and immutable', () => 
     models: [{
       model: 'picker-name', wireModel: 'account/deployment', adapterKind: 'gemini',
       endpointFamily: 'generate-content', authPolicy: { type: 'api-key', query: 'key' },
+      providerBaseUrl: 'https://native.test/v1beta',
+      routeCapabilities: { modality: 'text', toolCalling: true, reasoning: false },
     }],
   }]);
 
@@ -70,7 +72,10 @@ test('declared route metadata is validated, model-scoped, and immutable', () => 
   assert.equal(route.adapterKind, 'gemini');
   assert.equal(route.endpointFamily, 'generate-content');
   assert.equal(route.wireModel, 'account/deployment');
+  assert.equal(route.provider.baseUrl, 'https://native.test/v1beta');
   assert.deepEqual(route.authPolicy, { type: 'api-key', query: 'key' });
+  assert.deepEqual(route.capabilities, { modality: 'text', toolCalling: true, reasoning: false });
+  assert.ok(Object.isFrozen(route.capabilities));
   assert.throws(() => { route.wireModel = 'changed'; }, TypeError);
 });
 
@@ -87,6 +92,14 @@ test('invalid route metadata is rejected while building the catalog', () => {
   assert.throws(
     () => buildCatalog([{ ...base, authPolicy: { type: 'cookie' }, models: [{ model: 'm' }] }]),
     /auth policy type "cookie" is unsupported/
+  );
+  assert.throws(
+    () => buildCatalog([{ ...base, models: [{ model: 'm', providerBaseUrl: '/v1beta' }] }]),
+    /provider base URL must be an absolute HTTP\(S\) URL/
+  );
+  assert.throws(
+    () => buildCatalog([{ ...base, models: [{ model: 'm', routeCapabilities: 'tools' }] }]),
+    /capabilities must be an object/
   );
 });
 
