@@ -241,9 +241,27 @@ function addGeminiCalls(parts, pendingCalls, message, messageIndex) {
       throw invalidGeminiRequest(`Gemini function call "${call.id}" requires a name.`);
     }
     const args = parseJsonObject(serialized, `Gemini function call "${call.id}" arguments`);
-    parts.push({ functionCall: { name, args } });
+    const thoughtSignature = geminiThoughtSignature(call, index);
+    parts.push({
+      functionCall: { name, args },
+      ...(thoughtSignature === undefined ? {} : { thoughtSignature }),
+    });
     pendingCalls.set(call.id, { name, legacy: Boolean(call.legacy) });
   }
+}
+
+function geminiThoughtSignature(call, index) {
+  if (call.x_gemini === undefined) return undefined;
+  if (!call.x_gemini || typeof call.x_gemini !== 'object' || Array.isArray(call.x_gemini)) {
+    throw invalidGeminiRequest(`Gemini tool call ${index + 1} x_gemini must be an object.`);
+  }
+  const signature = call.x_gemini.thought_signature;
+  if (typeof signature !== 'string' || !signature) {
+    throw invalidGeminiRequest(
+      `Gemini tool call ${index + 1} x_gemini.thought_signature must be a non-empty string.`,
+    );
+  }
+  return signature;
 }
 
 function geminiFunctionResponse(message, pendingCalls) {
@@ -543,6 +561,7 @@ function handleGeminiPart(part, partIndex, candidateIndex, state, res, onEvent, 
     emitGeminiThoughtMetadata(part, partIndex, candidateIndex, onEvent);
     handleGeminiFunctionCall(
       part.functionCall,
+      part.thoughtSignature,
       partIndex,
       candidateIndex,
       state,
@@ -649,7 +668,17 @@ function geminiBlockedError(reason) {
   });
 }
 
-function handleGeminiFunctionCall(call, partIndex, candidateIndex, state, res, onEvent, streamId, model) {
+function handleGeminiFunctionCall(
+  call,
+  thoughtSignature,
+  partIndex,
+  candidateIndex,
+  state,
+  res,
+  onEvent,
+  streamId,
+  model,
+) {
   if (!call || typeof call !== 'object' || Array.isArray(call)
     || typeof call.name !== 'string' || !call.name
     || !call.args || typeof call.args !== 'object' || Array.isArray(call.args)) {
@@ -676,6 +705,9 @@ function handleGeminiFunctionCall(call, partIndex, candidateIndex, state, res, o
       id,
       type: 'function',
       function: { name: call.name, arguments: '' },
+      ...(thoughtSignature === undefined
+        ? {}
+        : { x_gemini: { thought_signature: thoughtSignature } }),
     }],
   });
   writeChunk(res, streamId, model, candidateIndex, {

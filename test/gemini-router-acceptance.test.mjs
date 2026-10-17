@@ -62,7 +62,10 @@ test('Gemini router acceptance preserves rich tools, thoughts, safety metadata, 
           parts: [
             { thought: true, text: 'private router thought', thoughtSignature: signature },
             { text: 'Using tools.' },
-            { functionCall: { name: 'first', args: { n: 1 } } },
+            {
+              functionCall: { name: 'first', args: { n: 1 } },
+              thoughtSignature: signature,
+            },
             { functionCall: { name: 'second', args: { city: 'Paris' } } },
           ],
         },
@@ -120,9 +123,97 @@ test('Gemini router acceptance preserves rich tools, thoughts, safety metadata, 
       inputTokens: 5, outputTokens: 7, totalTokens: 14, reasoningTokens: 2,
     }]);
     assert.deepEqual(assembled.finishes, ['tool-calls']);
-    assert.doesNotMatch(stream, /private router thought|router-hidden-signature/);
+    const firstCall = parsePayloads(stream)
+      .flatMap(({ choices }) => choices?.[0]?.delta?.tool_calls || [])
+      .find(({ index }) => index === 2);
+    assert.deepEqual(firstCall.x_gemini, { thought_signature: signature });
+    assert.doesNotMatch(stream, /private router thought/);
     assert.match(stream, /"finish_reason":"tool_calls"/);
     assert.equal(doneCount(stream), 1);
+  } finally {
+    await harness.close();
+  }
+});
+
+test('Gemini router acceptance round-trips function-call thought signatures', async () => {
+  const signature = 'router-tool-signature';
+  const requests = [];
+  const harness = await startHarness(async (req, res) => {
+    requests.push(await readJson(req));
+    if (requests.length === 1) {
+      sendFrames(res, [{
+        candidates: [{
+          index: 0,
+          content: {
+            parts: [{
+              functionCall: { name: 'lookup', args: { city: 'Berlin' } },
+              thoughtSignature: signature,
+            }],
+          },
+          finishReason: 'STOP',
+        }],
+      }]);
+      return;
+    }
+    sendFrames(res, [{
+      candidates: [{
+        index: 0,
+        content: { parts: [{ text: '21C' }] },
+        finishReason: 'STOP',
+      }],
+    }]);
+  });
+
+  try {
+    const first = await post(harness, {
+      ...basicRequest('Lookup Berlin.'),
+      tools: [{
+        type: 'function',
+        function: { name: 'lookup', parameters: { type: 'object' } },
+      }],
+    });
+    const firstStream = await first.text();
+    const call = parsePayloads(firstStream)
+      .flatMap(({ choices }) => choices?.[0]?.delta?.tool_calls || [])
+      .find(({ x_gemini }) => x_gemini);
+    assert.deepEqual(call.x_gemini, { thought_signature: signature });
+
+    const second = await post(harness, {
+      model: PICKER_MODEL,
+      stream: true,
+      messages: [
+        { role: 'user', content: 'Lookup Berlin.' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: call.id,
+            type: 'function',
+            function: { name: 'lookup', arguments: '{"city":"Berlin"}' },
+            x_gemini: call.x_gemini,
+          }],
+        },
+        { role: 'tool', tool_call_id: call.id, content: '{"temperature":21}' },
+      ],
+    });
+    assert.equal(second.status, 200);
+    assert.match(await second.text(), /"content":"21C"/);
+    assert.deepEqual(requests[1].contents, [
+      { role: 'user', parts: [{ text: 'Lookup Berlin.' }] },
+      {
+        role: 'model',
+        parts: [{
+          functionCall: { name: 'lookup', args: { city: 'Berlin' } },
+          thoughtSignature: signature,
+        }],
+      },
+      {
+        role: 'user',
+        parts: [{
+          functionResponse: { name: 'lookup', response: { temperature: 21 } },
+        }],
+      },
+    ]);
   } finally {
     await harness.close();
   }

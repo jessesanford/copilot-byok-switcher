@@ -78,6 +78,23 @@ test('Gemini adapter rejects unsupported request shapes before provider traffic'
         { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{' } }] },
       ],
     }],
+    ['malformed Gemini thought signature', {
+      stream: true,
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'lookup', arguments: '{}' },
+            x_gemini: { thought_signature: 42 },
+          }],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: '{}' },
+      ],
+    }],
     ['unmatched result', {
       stream: true,
       messages: [{ role: 'tool', tool_call_id: 'missing', content: '{}' }],
@@ -148,6 +165,7 @@ test('Gemini adapter translates conversations, tools, results, settings, and opt
                   id: 'call_weather',
                   type: 'function',
                   function: { name: 'weather', arguments: '{"city":"Berlin"}' },
+                  x_gemini: { thought_signature: 'opaque-weather-signature' },
                 }],
               },
               { role: 'tool', tool_call_id: 'call_weather', content: '{"temperature":21}' },
@@ -185,7 +203,10 @@ test('Gemini adapter translates conversations, tools, results, settings, and opt
               role: 'model',
               parts: [
                 { text: 'Checking.' },
-                { functionCall: { name: 'weather', args: { city: 'Berlin' } } },
+                {
+                  functionCall: { name: 'weather', args: { city: 'Berlin' } },
+                  thoughtSignature: 'opaque-weather-signature',
+                },
               ],
             },
             {
@@ -275,6 +296,7 @@ test('Gemini adapter translates legacy functions and omits unused optional field
 });
 
 test('Gemini adapter assembles ordered parallel function calls with stable identities', async () => {
+  const signature = 'opaque-weather-signature';
   const provider = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(frame({
@@ -283,7 +305,10 @@ test('Gemini adapter assembles ordered parallel function calls with stable ident
         content: {
           parts: [
             { text: 'Checking ' },
-            { functionCall: { name: 'weather', args: { city: 'Berlin' } } },
+            {
+              functionCall: { name: 'weather', args: { city: 'Berlin' } },
+              thoughtSignature: signature,
+            },
             { functionCall: { name: 'clock', args: { zone: 'Europe/Berlin' } } },
           ],
         },
@@ -295,7 +320,10 @@ test('Gemini adapter assembles ordered parallel function calls with stable ident
         content: {
           parts: [
             { text: '' },
-            { functionCall: { name: 'weather', args: { city: 'Berlin' } } },
+            {
+              functionCall: { name: 'weather', args: { city: 'Berlin' } },
+              thoughtSignature: signature,
+            },
             { functionCall: { name: 'clock', args: { zone: 'Europe/Berlin' } } },
           ],
         },
@@ -351,6 +379,7 @@ test('Gemini adapter assembles ordered parallel function calls with stable ident
         id: 'gemini-call-0-1',
         name: 'weather',
         arguments: '{"city":"Berlin"}',
+        x_gemini: { thought_signature: signature },
       },
       {
         index: 2,
@@ -593,6 +622,7 @@ function clientToolCalls(stream) {
       if (call.id) current.id += call.id;
       if (call.function?.name) current.name += call.function.name;
       if (call.function?.arguments) current.arguments += call.function.arguments;
+      if (call.x_gemini) current.x_gemini = call.x_gemini;
       calls.set(call.index, current);
     }
   }
